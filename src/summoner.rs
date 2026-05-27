@@ -62,13 +62,40 @@ impl Summoner {
         } else {
             self.cycle.touch(ident, wins.len())
         };
+        let main_idx = wins.iter().position(window::is_main).unwrap_or(0);
+        // When the app is already active, cycle = "step past whichever window
+        // the user is currently on". When inactive, just re-raise that window.
+        // This makes cycling independent of our internal cursor — every press
+        // moves to a different window, never a no-op.
+        let idx = if was_active {
+            (main_idx + 1) % wins.len()
+        } else {
+            main_idx
+        };
+        // Keep CycleState in sync so settings.cycle_reset_ms still has meaning
+        // for apps where is_main returns false on all windows (some background
+        // apps).
+        let _ = self.cycle.touch(ident, wins.len());
+
         let pick = &wins[idx];
         if window::is_minimized(pick) {
             window::unminimize(pick);
         }
+        window::focus(pick);
         window::raise(pick);
-        app::activate(&running);
-        info!(ident, idx, total = wins.len(), was_active, "summoned");
+        if !was_active {
+            app::activate(&running);
+        }
+        let picked_title = window::title(pick).unwrap_or_default();
+        info!(
+            ident,
+            idx,
+            main_idx,
+            total = wins.len(),
+            was_active,
+            picked = %picked_title,
+            "summoned"
+        );
         Ok(())
     }
 

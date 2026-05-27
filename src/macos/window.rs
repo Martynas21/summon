@@ -1,14 +1,14 @@
 use accessibility_sys::{
-    kAXErrorSuccess, kAXMinimizedAttribute, kAXRaiseAction, kAXStandardWindowSubrole,
-    kAXSubroleAttribute, kAXWindowsAttribute, AXUIElementCopyAttributeValue,
-    AXUIElementCreateApplication, AXUIElementPerformAction, AXUIElementRef,
-    AXUIElementSetAttributeValue,
+    kAXErrorSuccess, kAXFocusedAttribute, kAXMainAttribute, kAXMinimizedAttribute, kAXRaiseAction,
+    kAXStandardWindowSubrole, kAXSubroleAttribute, kAXTitleAttribute, kAXWindowsAttribute,
+    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementPerformAction,
+    AXUIElementRef, AXUIElementSetAttributeValue,
 };
 use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
 use core_foundation_sys::base::{CFRelease, CFRetain, CFTypeRef};
-use core_foundation_sys::number::{kCFBooleanFalse, CFBooleanGetValue};
+use core_foundation_sys::number::{kCFBooleanFalse, kCFBooleanTrue, CFBooleanGetValue};
 use core_foundation_sys::string::CFStringRef;
 use std::ptr;
 
@@ -103,6 +103,20 @@ fn copy_string_attr(el: AXUIElementRef, key: &str) -> Option<String> {
     Some(cf.to_string())
 }
 
+pub fn is_main(window: &WindowEl) -> bool {
+    let attr = cfstr(kAXMainAttribute);
+    let mut value: CFTypeRef = ptr::null();
+    let err = unsafe {
+        AXUIElementCopyAttributeValue(window.0, attr.as_concrete_TypeRef(), &mut value)
+    };
+    if err != kAXErrorSuccess || value.is_null() {
+        return false;
+    }
+    let result = unsafe { CFBooleanGetValue(value as _) };
+    unsafe { CFRelease(value) };
+    result
+}
+
 pub fn is_minimized(window: &WindowEl) -> bool {
     let attr = cfstr(kAXMinimizedAttribute);
     let mut value: CFTypeRef = ptr::null();
@@ -132,6 +146,30 @@ pub fn raise(window: &WindowEl) {
     let action = cfstr(kAXRaiseAction);
     unsafe {
         let _ = AXUIElementPerformAction(window.0, action.as_concrete_TypeRef());
+    }
+}
+
+pub fn title(window: &WindowEl) -> Option<String> {
+    copy_string_attr(window.0, kAXTitleAttribute)
+}
+
+/// Mark window as the app's main+focused window. Required when the app is
+/// already foreground — AXRaise on its own doesn't change which window
+/// the OS treats as the app's main one, so focus snaps back.
+pub fn focus(window: &WindowEl) {
+    unsafe {
+        let main = cfstr(kAXMainAttribute);
+        let _ = AXUIElementSetAttributeValue(
+            window.0,
+            main.as_concrete_TypeRef(),
+            kCFBooleanTrue as _,
+        );
+        let focused = cfstr(kAXFocusedAttribute);
+        let _ = AXUIElementSetAttributeValue(
+            window.0,
+            focused.as_concrete_TypeRef(),
+            kCFBooleanTrue as _,
+        );
     }
 }
 
