@@ -17,7 +17,19 @@ pub fn running_pid() -> Result<u32> {
 }
 
 /// Send SIGHUP to the running daemon to trigger a config reload.
+/// Validates the config first so the user sees parse errors immediately
+/// (the daemon would have failed silently and kept the old config).
 pub fn reload() -> Result<()> {
+    let cfg_path = crate::paths::config_file()?;
+    match crate::config::load(&cfg_path) {
+        Ok(cfg) => {
+            println!("config ok ({} bindings)", cfg.bindings.len());
+        }
+        Err(e) => {
+            eprintln!("config invalid — daemon will not reload:\n{e:#}");
+            return Err(e);
+        }
+    }
     let pid = running_pid()?;
     send_signal(pid, nix::sys::signal::Signal::SIGHUP)
         .with_context(|| format!("sending SIGHUP to pid {pid}"))?;

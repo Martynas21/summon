@@ -22,7 +22,6 @@ pub struct Summoner {
     /// "consecutive presses of the same hotkey" — only those count as cycle
     /// intent. Pressing Ctrl+1 → Ctrl+2 → Ctrl+1 must NOT cycle.
     last_press: Option<(String, Instant)>,
-    launch_timeout: Duration,
     /// Max gap between two same-hotkey presses for the second to count as
     /// a cycle continuation.
     cycle_window: Duration,
@@ -33,7 +32,6 @@ impl Summoner {
         Self {
             cursors: HashMap::new(),
             last_press: None,
-            launch_timeout: Duration::from_secs(5),
             cycle_window: derive_cycle_window(cfg.settings.cycle_reset_ms),
         }
     }
@@ -45,15 +43,21 @@ impl Summoner {
 
     #[cfg(target_os = "macos")]
     pub fn summon(&mut self, ident: &str) -> Result<()> {
-        let (running, was_launched) = match app::find_running(ident) {
-            Some(a) => (a, false),
+        let running = match app::find_running(ident) {
+            Some(a) => a,
             None => {
-                info!(ident, "launching");
-                let a = app::launch_and_wait(ident, self.launch_timeout)
+                // Fire-and-forget: `open` itself activates the app. Blocking
+                // here on launch_and_wait freezes the worker for up to 5s,
+                // causing every other hotkey press to queue behind it.
+                // The user's next press of this hotkey will be the cycle/focus
+                // path once the app is in runningApplications.
+                info!(ident, "launching (fire-and-forget)");
+                app::launch(ident)
                     .with_context(|| format!("launching {ident}"))?;
-                (a, true)
+                return Ok(());
             }
         };
+        let was_launched = false;
         let pid = app::pid(&running);
         let resolved_bundle = app::bundle_id(&running).unwrap_or_default();
         let resolved_name = app::name(&running).unwrap_or_default();
