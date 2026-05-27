@@ -110,3 +110,8 @@ pub fn activate(app: &NSRunningApplication) {
 pub fn pid(app: &NSRunningApplication) -> i32 {
     unsafe { app.processIdentifier() }
 }
+
+/// True if this app currently owns the frontmost window / has the menu bar.
+pub fn is_active(app: &NSRunningApplication) -> bool {
+    unsafe { app.isActive() }
+}

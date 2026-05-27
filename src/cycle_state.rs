@@ -55,6 +55,29 @@ impl CycleState {
         self.entries.get(app).map(|e| e.cursor).unwrap_or(0)
     }
 
+    /// Read (and refresh timestamp on) the current cursor for `app`, clamped to
+    /// the current `window_count`. Used when the app was not the frontmost app
+    /// at press time: we want to re-raise the most recently summoned window,
+    /// not advance to the next one.
+    pub fn touch(&mut self, app: &str, window_count: usize) -> usize {
+        if window_count == 0 {
+            return 0;
+        }
+        let now = Instant::now();
+        let entry = self.entries.entry(app.to_string()).or_insert(Entry {
+            cursor: 0,
+            last_press: now,
+        });
+        if let Some(reset) = self.reset_after {
+            if now.duration_since(entry.last_press) > reset {
+                entry.cursor = 0;
+            }
+        }
+        entry.cursor = entry.cursor.min(window_count - 1);
+        entry.last_press = now;
+        entry.cursor
+    }
+
     /// Reset the cursor for one app (e.g. after the app quits).
     pub fn reset(&mut self, app: &str) {
         self.entries.remove(app);
@@ -105,5 +128,24 @@ mod tests {
         s.advance("a", 5);
         s.reset("a");
         assert_eq!(s.current("a"), 0);
+    }
+
+    #[test]
+    fn touch_holds_cursor_without_advancing() {
+        let mut s = CycleState::new(0);
+        s.advance("a", 3); // cursor → 1
+        s.advance("a", 3); // cursor → 2
+        assert_eq!(s.touch("a", 3), 2);
+        assert_eq!(s.touch("a", 3), 2);
+        assert_eq!(s.current("a"), 2);
+    }
+
+    #[test]
+    fn touch_clamps_when_windows_shrink() {
+        let mut s = CycleState::new(0);
+        s.advance("a", 5);
+        s.advance("a", 5);
+        s.advance("a", 5); // cursor → 3
+        assert_eq!(s.touch("a", 2), 1); // clamped to count - 1
     }
 }

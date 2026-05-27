@@ -25,14 +25,18 @@ impl Summoner {
 
     #[cfg(target_os = "macos")]
     pub fn summon(&mut self, ident: &str) -> Result<()> {
-        let running = match app::find_running(ident) {
-            Some(a) => a,
+        let (running, was_launched) = match app::find_running(ident) {
+            Some(a) => (a, false),
             None => {
                 info!(ident, "launching");
-                app::launch_and_wait(ident, self.launch_timeout)
-                    .with_context(|| format!("launching {ident}"))?
+                let a = app::launch_and_wait(ident, self.launch_timeout)
+                    .with_context(|| format!("launching {ident}"))?;
+                (a, true)
             }
         };
+        // Snapshot active-state *before* we touch anything (activate flips it).
+        let was_active = !was_launched && app::is_active(&running);
+
         app::ensure_visible(&running);
 
         let pid = app::pid(&running);
@@ -50,14 +54,21 @@ impl Summoner {
             app::activate(&running);
             return Ok(());
         }
-        let idx = self.cycle.advance(ident, wins.len());
+        // Already-frontmost → cycle to next. Otherwise just re-raise the most
+        // recently summoned window so back-and-forth (Ctrl+Shift+1, +2, +1)
+        // returns to a stable window.
+        let idx = if was_active {
+            self.cycle.advance(ident, wins.len())
+        } else {
+            self.cycle.touch(ident, wins.len())
+        };
         let pick = &wins[idx];
         if window::is_minimized(pick) {
             window::unminimize(pick);
         }
         window::raise(pick);
         app::activate(&running);
-        info!(ident, idx, total = wins.len(), "summoned");
+        info!(ident, idx, total = wins.len(), was_active, "summoned");
         Ok(())
     }
 
