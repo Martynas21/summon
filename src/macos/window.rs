@@ -1,9 +1,16 @@
 use accessibility_sys::{
     kAXErrorSuccess, kAXFocusedAttribute, kAXMainAttribute, kAXMinimizedAttribute, kAXRaiseAction,
     kAXStandardWindowSubrole, kAXSubroleAttribute, kAXTitleAttribute, kAXWindowsAttribute,
-    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementPerformAction,
-    AXUIElementRef, AXUIElementSetAttributeValue,
+    AXError, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
+    AXUIElementPerformAction, AXUIElementRef, AXUIElementSetAttributeValue,
 };
+
+// Private but stable since macOS 10.x — used by yabai, Hammerspoon, Rectangle,
+// skhd. Maps an AXUIElement to its CGWindowID, which is the only identifier
+// that is stable across AX queries (AXUIElementRef pointers are not).
+extern "C" {
+    fn _AXUIElementGetWindow(element: AXUIElementRef, window_id: *mut u32) -> AXError;
+}
 use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
@@ -36,11 +43,17 @@ impl Drop for AppEl {
 pub struct WindowEl(AXUIElementRef);
 
 impl WindowEl {
-    /// Raw AXUIElementRef as `usize`. Apple's AX maintains identity per
-    /// window — the same window returns the same pointer across queries —
-    /// so this is a stable cross-press handle for cycle tracking.
-    pub fn id(&self) -> usize {
-        self.0 as usize
+    /// Stable cross-press identifier. Reads the underlying CGWindowID via the
+    /// private `_AXUIElementGetWindow`. Returns None on the rare app that
+    /// refuses the call (we fall back to picking window 0 in that case).
+    pub fn window_id(&self) -> Option<u32> {
+        let mut id: u32 = 0;
+        let err = unsafe { _AXUIElementGetWindow(self.0, &mut id) };
+        if err == kAXErrorSuccess {
+            Some(id)
+        } else {
+            None
+        }
     }
 }
 

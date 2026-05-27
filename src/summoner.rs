@@ -11,27 +11,35 @@ use tracing::{info, warn};
 /// from that window; while inactive we re-raise it. The cursor lives in
 /// our own memory (not AX) because AX attribute reads lag our writes.
 struct AppCursor {
-    last_window: Option<usize>,
+    /// CGWindowID of the window we last raised. Stable across AX queries.
+    last_window: Option<u32>,
     last_press: Instant,
 }
 
 pub struct Summoner {
     cursors: HashMap<String, AppCursor>,
+    /// The most recent hotkey we processed and when. Used to detect
+    /// "consecutive presses of the same hotkey" — only those count as cycle
+    /// intent. Pressing Ctrl+1 → Ctrl+2 → Ctrl+1 must NOT cycle.
+    last_press: Option<(String, Instant)>,
     launch_timeout: Duration,
-    cycle_reset_ms: u64,
+    /// Max gap between two same-hotkey presses for the second to count as
+    /// a cycle continuation.
+    cycle_window: Duration,
 }
 
 impl Summoner {
     pub fn new(cfg: &ParsedConfig) -> Self {
         Self {
             cursors: HashMap::new(),
+            last_press: None,
             launch_timeout: Duration::from_secs(5),
-            cycle_reset_ms: cfg.settings.cycle_reset_ms,
+            cycle_window: derive_cycle_window(cfg.settings.cycle_reset_ms),
         }
     }
 
     pub fn reconfigure(&mut self, cfg: &ParsedConfig) {
-        self.cycle_reset_ms = cfg.settings.cycle_reset_ms;
+        self.cycle_window = derive_cycle_window(cfg.settings.cycle_reset_ms);
         // Keep cursor map across reloads so the user doesn't lose their place.
     }
 
@@ -79,25 +87,28 @@ impl Summoner {
         }
 
         let now = Instant::now();
-        let reset_ms = self.cycle_reset_ms;
+        let cycle_window = self.cycle_window;
+
+        // "Cycle intent" = the immediately previous press was THIS same hotkey,
+        // within cycle_window. Pressing a different hotkey resets the chain,
+        // so Ctrl+1 → Ctrl+2 → Ctrl+1 returns the user to the same Ghostty
+        // window they last had focused, not the next one.
+        let is_rapid = matches!(
+            &self.last_press,
+            Some((prev_ident, prev_time))
+                if prev_ident == ident && now.duration_since(*prev_time) <= cycle_window
+        );
+
         let cursor = self.cursors.entry(ident.to_string()).or_insert(AppCursor {
             last_window: None,
             last_press: now,
         });
-        if reset_ms > 0
-            && now.duration_since(cursor.last_press) > Duration::from_millis(reset_ms)
-        {
-            cursor.last_window = None;
-        }
         let last_idx = cursor
             .last_window
-            .and_then(|p| wins.iter().position(|w| w.id() == p));
+            .and_then(|id| wins.iter().position(|w| w.window_id() == Some(id)));
 
-        let idx = if was_active && wins.len() > 1 {
-            match last_idx {
-                Some(i) => (i + 1) % wins.len(),
-                None => 0,
-            }
+        let idx = if is_rapid && last_idx.is_some() && wins.len() > 1 {
+            (last_idx.unwrap() + 1) % wins.len()
         } else {
             last_idx.unwrap_or(0)
         };
@@ -111,8 +122,9 @@ impl Summoner {
         if !was_active {
             app::activate(&running);
         }
-        cursor.last_window = Some(pick.id());
+        cursor.last_window = pick.window_id();
         cursor.last_press = now;
+        self.last_press = Some((ident.to_string(), now));
 
         let picked_title = window::title(pick).unwrap_or_default();
         info!(
@@ -120,6 +132,7 @@ impl Summoner {
             idx,
             total = wins.len(),
             was_active,
+            is_rapid,
             had_last = last_idx.is_some(),
             picked = %picked_title,
             "summoned"
@@ -130,5 +143,14 @@ impl Summoner {
     #[cfg(not(target_os = "macos"))]
     pub fn summon(&mut self, _ident: &str) -> Result<()> {
         anyhow::bail!("summon is macOS-only");
+    }
+}
+
+fn derive_cycle_window(configured_ms: u64) -> Duration {
+    // 0 = "use the sensible default" (1500ms). Any positive value overrides.
+    if configured_ms == 0 {
+        Duration::from_millis(1500)
+    } else {
+        Duration::from_millis(configured_ms)
     }
 }
