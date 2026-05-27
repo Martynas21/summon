@@ -111,7 +111,15 @@ pub fn pid(app: &NSRunningApplication) -> i32 {
     unsafe { app.processIdentifier() }
 }
 
-/// True if this app currently owns the frontmost window / has the menu bar.
+/// True if this app currently owns the frontmost window. We can't trust
+/// `NSRunningApplication.isActive()` from a worker thread because the
+/// property is KVO-driven from the main runloop and goes stale here.
+/// Querying `NSWorkspace.frontmostApplication()` returns a live snapshot.
 pub fn is_active(app: &NSRunningApplication) -> bool {
-    unsafe { app.isActive() }
+    let target = unsafe { app.processIdentifier() };
+    let ws = unsafe { NSWorkspace::sharedWorkspace() };
+    match unsafe { ws.frontmostApplication() } {
+        Some(front) => (unsafe { front.processIdentifier() }) == target,
+        None => false,
+    }
 }
