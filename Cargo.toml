@@ -1,0 +1,40 @@
+[package]
+name = "summon"
+version = "0.1.0"
+edition = "2021"
+description = "macOS app/window summoner — bind a hotkey to an app, press to summon"
+license = "MIT"
+
+[lib]
+name = "summon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "summon"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+directories = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+nix = { version = "0.29", features = ["signal", "process"] }
+global-hotkey = "0.6"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+core-graphics = "0.24"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSString", "NSURL", "NSArray", "NSRunLoop", "NSNotification"] }
+objc2-app-kit = { version = "0.2", features = ["NSWorkspace", "NSRunningApplication", "NSApplication", "libc"] }
+libc = "0.2"
+accessibility-sys = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,19 @@
+# summon — example config. Copy to ~/.config/summon/config.toml.
+#
+# Each binding maps a hotkey string to either:
+#   - a bundle id (preferred — never collides, never breaks on app rename)
+#   - a display name (fallback if you don't know the bundle id)
+#
+# Find a bundle id: `mdls -name kMDItemCFBundleIdentifier /Applications/<App>.app`
+#
+# Modifiers: ctrl, alt (= opt/option), shift, cmd (= command/meta), hyper (= all four).
+# Keys: a-z, 0-9, f1-f20, space, tab, enter, escape, arrows, home/end/pageup/pagedown.
+
+[settings]
+# Reset the per-app cycle cursor after N ms of inactivity. 0 = never reset.
+cycle_reset_ms = 0
+
+[bindings]
+"ctrl+1" = "com.mitchellh.ghostty"   # Ghostty terminal
+"ctrl+2" = "Google Chrome"           # by display name
+"ctrl+3" = "com.apple.finder"        # Finder
