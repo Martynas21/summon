@@ -169,7 +169,8 @@ fn worker_loop(
                     if let Some(ident) = ident {
                         info!(ident, id = event.id, "hotkey fired");
                         let mut s = summoner.lock().unwrap();
-                        if let Err(e) = s.summon(&ident) {
+                        let result = s.summon(&ident);
+                        if let Err(e) = result {
                             warn!(ident, "summon failed: {e:#}");
                         }
                     } else {

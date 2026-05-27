@@ -8,7 +8,7 @@ use accessibility_sys::{
 // Private but stable since macOS 10.x — used by yabai, Hammerspoon, Rectangle,
 // skhd. Maps an AXUIElement to its CGWindowID, which is the only identifier
 // that is stable across AX queries (AXUIElementRef pointers are not).
-extern "C" {
+unsafe extern "C" {
     fn _AXUIElementGetWindow(element: AXUIElementRef, window_id: *mut u32) -> AXError;
 }
 use core_foundation::base::TCFType;

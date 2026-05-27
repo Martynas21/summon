@@ -1,7 +1,7 @@
 [package]
 name = "summon"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "macOS app/window summoner — bind a hotkey to an app, press to summon"
 license = "MIT"
 
