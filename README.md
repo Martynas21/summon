@@ -15,8 +15,13 @@ You want `Ctrl+1` to always show Ghostty, `Ctrl+2` to always show Chrome, etc. E
 cd ~/Projects/summon
 cargo build --release
 
-# 2. Put binary on PATH (or use full path)
-ln -sf "$PWD/target/release/summon" /usr/local/bin/summon
+# 2. Put binary on PATH. ~/.local/bin works on user account; no sudo needed.
+mkdir -p ~/.local/bin
+ln -sf "$PWD/target/release/summon" ~/.local/bin/summon
+# Add ~/.local/bin to PATH if you haven't already:
+#   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+# Apple Silicon alternative if you prefer the brew prefix:
+#   ln -sf "$PWD/target/release/summon" /opt/homebrew/bin/summon
 
 # 3. Seed a config
 mkdir -p ~/.config/summon
