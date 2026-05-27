@@ -31,8 +31,8 @@ core-graphics = "0.24"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
-objc2-foundation = { version = "0.2", features = ["NSString", "NSURL", "NSArray", "NSRunLoop", "NSNotification"] }
-objc2-app-kit = { version = "0.2", features = ["NSWorkspace", "NSRunningApplication", "NSApplication", "libc"] }
+objc2-foundation = { version = "0.2", features = ["NSString", "NSURL", "NSArray", "NSRunLoop", "NSNotification", "NSThread"] }
+objc2-app-kit = { version = "0.2", features = ["NSWorkspace", "NSRunningApplication", "NSApplication", "NSResponder", "libc"] }
 libc = "0.2"
 accessibility-sys = "0.1"
 

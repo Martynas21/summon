@@ -2,7 +2,9 @@ use crate::hotkey::HotkeyRegistry;
 use crate::paths;
 use crate::summoner::Summoner;
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -17,11 +19,18 @@ pub fn run() -> Result<()> {
         if !crate::macos::permissions::request_trust() {
             eprintln!(
                 "summon: Accessibility permission required.\n\
-                 Grant in System Settings → Privacy & Security → Accessibility, then re-run.\n\
-                 (A system prompt may have just appeared if this is the first run.)"
+                 Grant in System Settings → Privacy & Security → Accessibility, then re-run."
             );
             std::process::exit(2);
         }
+    }
+
+    if let Ok(existing) = crate::ipc::running_pid() {
+        eprintln!(
+            "summon: another daemon is already running (pid {existing}).\n\
+             Use `summon reload` to re-read config, or `pkill summon` to stop it."
+        );
+        std::process::exit(1);
     }
 
     let cfg_path = paths::config_file()?;
@@ -29,9 +38,11 @@ pub fn run() -> Result<()> {
         .with_context(|| format!("loading {}", cfg_path.display()))?;
     info!(path = %cfg_path.display(), bindings = cfg.bindings.len(), "loaded config");
 
-    let mut summoner = Summoner::new(&cfg);
-    let mut registry = HotkeyRegistry::new()?;
+    let summoner = Arc::new(Mutex::new(Summoner::new(&cfg)));
+    let registry = Arc::new(Mutex::new(HotkeyRegistry::new()?));
     registry
+        .lock()
+        .unwrap()
         .register_all(&cfg.bindings)
         .context("registering hotkeys")?;
 
@@ -39,11 +50,28 @@ pub fn run() -> Result<()> {
     install_signal_handlers()?;
 
     info!(pid = std::process::id(), "summon daemon running");
-    main_loop(&mut summoner, &mut registry, &cfg_path);
+
+    #[cfg(target_os = "macos")]
+    {
+        // Spawn worker BEFORE the NSApplication runloop blocks the main thread.
+        let s_w = Arc::clone(&summoner);
+        let r_w = Arc::clone(&registry);
+        std::thread::spawn(move || worker_loop(s_w, r_w, cfg_path));
+
+        // Block main thread on NSApp.run — this is what actually pumps Carbon
+        // hotkey events. CFRunLoop alone doesn't dispatch them.
+        run_nsapp();
+        // Unreachable in normal operation; STOP path exits via worker.
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = registry;
+        let _ = summoner;
+        let _ = cfg_path;
+        eprintln!("summon: only macOS is supported");
+    }
 
     cleanup_pid_file();
-    registry.unregister_all();
-    info!("summon daemon stopped");
     Ok(())
 }
 
@@ -99,50 +127,76 @@ fn install_signal_handlers() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn main_loop(summoner: &mut Summoner, registry: &mut HotkeyRegistry, cfg_path: &std::path::Path) {
-    use core_foundation_sys::runloop::{kCFRunLoopDefaultMode, CFRunLoopRunInMode};
+fn run_nsapp() {
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    use objc2_foundation::MainThreadMarker;
+    let mtm = MainThreadMarker::new().expect("daemon must run on the main thread");
+    let app = NSApplication::sharedApplication(mtm);
+    unsafe {
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+        app.run();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn worker_loop(
+    summoner: Arc<Mutex<Summoner>>,
+    registry: Arc<Mutex<HotkeyRegistry>>,
+    cfg_path: PathBuf,
+) {
     use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
+    use std::time::Duration;
 
     let receiver = GlobalHotKeyEvent::receiver();
-    while !STOP.load(Ordering::Relaxed) {
-        // Pump main-thread runloop briefly so Carbon hotkey events fire.
-        unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, 0) };
-
-        while let Ok(event) = receiver.try_recv() {
-            if event.state == HotKeyState::Pressed {
-                if let Some(ident) = registry.app_for(event.id) {
-                    let ident = ident.to_string();
-                    if let Err(e) = summoner.summon(&ident) {
-                        warn!(ident = %ident, "summon failed: {e:#}");
+    loop {
+        if STOP.load(Ordering::Relaxed) {
+            info!("SIGTERM received; shutting down");
+            cleanup_pid_file();
+            registry.lock().unwrap().unregister_all();
+            std::process::exit(0);
+        }
+        if RELOAD.swap(false, Ordering::Relaxed) {
+            handle_reload(&summoner, &registry, &cfg_path);
+        }
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => {
+                if event.state == HotKeyState::Pressed {
+                    let ident = registry
+                        .lock()
+                        .unwrap()
+                        .app_for(event.id)
+                        .map(str::to_owned);
+                    if let Some(ident) = ident {
+                        info!(ident, id = event.id, "hotkey fired");
+                        let mut s = summoner.lock().unwrap();
+                        if let Err(e) = s.summon(&ident) {
+                            warn!(ident, "summon failed: {e:#}");
+                        }
+                    } else {
+                        warn!(id = event.id, "unmapped hotkey event");
                     }
                 }
             }
-        }
-
-        if RELOAD.swap(false, Ordering::Relaxed) {
-            handle_reload(summoner, registry, cfg_path);
+            Err(_) => continue,
         }
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn main_loop(_: &mut Summoner, _: &mut HotkeyRegistry, _: &std::path::Path) {
-    eprintln!("summon: only macOS is supported");
-}
-
+#[cfg(target_os = "macos")]
 fn handle_reload(
-    summoner: &mut Summoner,
-    registry: &mut HotkeyRegistry,
+    summoner: &Arc<Mutex<Summoner>>,
+    registry: &Arc<Mutex<HotkeyRegistry>>,
     cfg_path: &std::path::Path,
 ) {
     info!("SIGHUP received; reloading config");
     match crate::config::load(cfg_path) {
         Ok(new_cfg) => {
-            registry.unregister_all();
-            if let Err(e) = registry.register_all(&new_cfg.bindings) {
+            let mut r = registry.lock().unwrap();
+            r.unregister_all();
+            if let Err(e) = r.register_all(&new_cfg.bindings) {
                 error!("re-registering hotkeys after reload: {e:#}");
             }
-            summoner.reconfigure(&new_cfg);
+            summoner.lock().unwrap().reconfigure(&new_cfg);
             info!(bindings = new_cfg.bindings.len(), "reload complete");
         }
         Err(e) => error!("reload: failed to parse config: {e:#}"),
