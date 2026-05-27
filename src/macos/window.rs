@@ -35,6 +35,15 @@ impl Drop for AppEl {
 /// AXUIElement for a single window. Drops via CFRelease.
 pub struct WindowEl(AXUIElementRef);
 
+impl WindowEl {
+    /// Raw AXUIElementRef as `usize`. Apple's AX maintains identity per
+    /// window — the same window returns the same pointer across queries —
+    /// so this is a stable cross-press handle for cycle tracking.
+    pub fn id(&self) -> usize {
+        self.0 as usize
+    }
+}
+
 impl Drop for WindowEl {
     fn drop(&mut self) {
         unsafe { CFRelease(self.0 as _) }

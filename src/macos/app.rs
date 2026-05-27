@@ -117,9 +117,22 @@ pub fn pid(app: &NSRunningApplication) -> i32 {
 /// Querying `NSWorkspace.frontmostApplication()` returns a live snapshot.
 pub fn is_active(app: &NSRunningApplication) -> bool {
     let target = unsafe { app.processIdentifier() };
-    let ws = unsafe { NSWorkspace::sharedWorkspace() };
-    match unsafe { ws.frontmostApplication() } {
-        Some(front) => (unsafe { front.processIdentifier() }) == target,
+    match frontmost_pid() {
+        Some(pid) => pid == target,
         None => false,
     }
+}
+
+/// PID of whichever app currently has the frontmost window.
+pub fn frontmost_pid() -> Option<i32> {
+    let ws = unsafe { NSWorkspace::sharedWorkspace() };
+    unsafe { ws.frontmostApplication() }.map(|a| unsafe { a.processIdentifier() })
+}
+
+pub fn bundle_id(app: &NSRunningApplication) -> Option<String> {
+    unsafe { app.bundleIdentifier() }.map(|ns| ns.to_string())
+}
+
+pub fn name(app: &NSRunningApplication) -> Option<String> {
+    unsafe { app.localizedName() }.map(|ns| ns.to_string())
 }
