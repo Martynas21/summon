@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use objc2::rc::Retained;
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
+use objc2_foundation::NSString;
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -21,11 +22,16 @@ pub fn find_running(ident: &str) -> Option<Retained<NSRunningApplication>> {
 }
 
 pub fn find_by_bundle_id(bid: &str) -> Option<Retained<NSRunningApplication>> {
-    for_each_app(|app| {
-        unsafe { app.bundleIdentifier() }
-            .map(|ns| ns.to_string() == bid)
-            .unwrap_or(false)
-    })
+    // System-side filtered lookup beats iterating all running apps. O(1) vs
+    // O(N) over the runningApplications array. Returns matches across all
+    // instances (Chrome can have several PIDs); we take the first.
+    let ns = NSString::from_str(bid);
+    let arr = unsafe { NSRunningApplication::runningApplicationsWithBundleIdentifier(&ns) };
+    if arr.count() == 0 {
+        None
+    } else {
+        Some(unsafe { arr.objectAtIndex(0) })
+    }
 }
 
 pub fn find_by_name(name: &str) -> Option<Retained<NSRunningApplication>> {
@@ -111,19 +117,13 @@ pub fn pid(app: &NSRunningApplication) -> i32 {
     unsafe { app.processIdentifier() }
 }
 
-/// True if this app currently owns the frontmost window. We can't trust
-/// `NSRunningApplication.isActive()` from a worker thread because the
-/// property is KVO-driven from the main runloop and goes stale here.
-/// Querying `NSWorkspace.frontmostApplication()` returns a live snapshot.
-pub fn is_active(app: &NSRunningApplication) -> bool {
-    let target = unsafe { app.processIdentifier() };
-    match frontmost_pid() {
-        Some(pid) => pid == target,
-        None => false,
-    }
-}
-
-/// PID of whichever app currently has the frontmost window.
+/// PID of whichever app currently has the frontmost window. Callers needing
+/// "is this app active" should compare this against the app's PID directly,
+/// reusing a single `frontmost_pid()` call rather than making two ObjC
+/// round-trips per press.
+///
+/// Note: `NSRunningApplication.isActive()` is KVO-driven from the main
+/// runloop and can be stale on worker threads — always go through this.
 pub fn frontmost_pid() -> Option<i32> {
     let ws = unsafe { NSWorkspace::sharedWorkspace() };
     unsafe { ws.frontmostApplication() }.map(|a| unsafe { a.processIdentifier() })

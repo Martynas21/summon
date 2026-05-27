@@ -61,8 +61,10 @@ impl Summoner {
         let pid = app::pid(&running);
         let resolved_bundle = app::bundle_id(&running).unwrap_or_default();
         let resolved_name = app::name(&running).unwrap_or_default();
-        let was_active = !was_launched && app::is_active(&running);
+        // One NSWorkspace round-trip serves both was_active and the log
+        // field; the previous version called frontmostApplication twice.
         let frontmost_pid = app::frontmost_pid().unwrap_or(0);
+        let was_active = !was_launched && frontmost_pid == pid;
         info!(
             ident,
             pid,
@@ -130,7 +132,13 @@ impl Summoner {
         cursor.last_press = now;
         self.last_press = Some((ident.to_string(), now));
 
-        let picked_title = window::title(pick).unwrap_or_default();
+        // `window::title` is a synchronous AX IPC (~1-5ms). Only pay the
+        // cost when DEBUG logging is enabled; the info line below stays
+        // useful without the title field.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let picked_title = window::title(pick).unwrap_or_default();
+            tracing::debug!(ident, picked = %picked_title, "picked window");
+        }
         info!(
             ident,
             idx,
@@ -138,7 +146,6 @@ impl Summoner {
             was_active,
             is_rapid,
             had_last = last_idx.is_some(),
-            picked = %picked_title,
             "summoned"
         );
         Ok(())

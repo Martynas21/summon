@@ -150,7 +150,11 @@ fn spawn_hotkey_forwarder() {
                 match receiver.recv() {
                     Ok(event) => {
                         if event.state == HotKeyState::Pressed {
-                            let ctx = Box::into_raw(Box::new(event.id)) as *mut std::ffi::c_void;
+                            // Embed the u32 hotkey id directly in the
+                            // context pointer (always 64-bit on macOS).
+                            // Avoids a per-press heap alloc on the forwarder
+                            // thread and a Box::from_raw on the main thread.
+                            let ctx = event.id as usize as *mut std::ffi::c_void;
                             unsafe { dispatch::async_to_main(ctx, on_hotkey_main) };
                         }
                     }
@@ -166,7 +170,7 @@ fn spawn_hotkey_forwarder() {
 
 #[cfg(target_os = "macos")]
 extern "C" fn on_hotkey_main(ctx: *mut std::ffi::c_void) {
-    let id = unsafe { *Box::from_raw(ctx as *mut u32) };
+    let id = ctx as usize as u32;
     let Some(state_lock) = STATE.get() else {
         return;
     };
