@@ -19,6 +19,8 @@ pub enum Cmd {
     Uninstall,
     /// Re-read the config file in the running daemon (sends SIGHUP).
     Reload,
+    /// Stop the running daemon (sends SIGTERM).
+    Stop,
     /// Report daemon status, AX permission, and config validity.
     Status,
     /// Parse-check a config file (defaults to ~/.config/summon/config.toml).
@@ -26,6 +28,10 @@ pub enum Cmd {
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
     },
+    /// Internal: launchd-spawned helper that fires the TCC modal under
+    /// launchd attribution. Not for direct use.
+    #[command(name = "_grant", hide = true)]
+    Grant,
 }
 
 pub fn run(args: Cli) -> Result<()> {
@@ -34,8 +40,10 @@ pub fn run(args: Cli) -> Result<()> {
         Cmd::Install => crate::launchd::install(),
         Cmd::Uninstall => crate::launchd::uninstall(),
         Cmd::Reload => crate::ipc::reload(),
+        Cmd::Stop => crate::ipc::stop(),
         Cmd::Status => status(),
         Cmd::Validate { path } => validate(path),
+        Cmd::Grant => crate::launchd::grant(),
     }
 }
 

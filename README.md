@@ -46,6 +46,7 @@ summon install
 | `summon install`       | Write a LaunchAgent plist + bootstrap it. Auto-start on login.     |
 | `summon uninstall`     | Stop and remove the LaunchAgent.                                   |
 | `summon reload`        | Re-read the config in the running daemon (sends `SIGHUP`).         |
+| `summon stop`          | Stop the running daemon (sends `SIGTERM`). launchd will restart it if installed. |
 | `summon status`        | Report daemon pid, AX permission, config validity.                 |
 | `summon validate [PATH]` | Parse-check a config file. Defaults to `~/.config/summon/config.toml`. |
 

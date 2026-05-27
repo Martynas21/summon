@@ -3,23 +3,37 @@ use crate::paths;
 use crate::summoner::Summoner;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, OnceLock};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-static RELOAD: AtomicBool = AtomicBool::new(false);
-static STOP: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+struct State {
+    summoner: Summoner,
+    registry: HotkeyRegistry,
+    cfg_path: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
 pub fn run() -> Result<()> {
     init_logging();
 
     #[cfg(target_os = "macos")]
     {
-        if !crate::macos::permissions::request_trust() {
+        // Only prompt when launched from a terminal. Under launchd KeepAlive,
+        // a missing grant would otherwise spam the TCC modal every respawn.
+        let trusted = if is_foreground() {
+            crate::macos::permissions::request_trust()
+        } else {
+            crate::macos::permissions::is_trusted()
+        };
+        if !trusted {
             eprintln!(
                 "summon: Accessibility permission required.\n\
-                 Grant in System Settings → Privacy & Security → Accessibility, then re-run."
+                 Run `summon run` from a terminal to trigger the prompt,\n\
+                 then grant in System Settings → Privacy & Security → Accessibility."
             );
             std::process::exit(2);
         }
@@ -38,35 +52,37 @@ pub fn run() -> Result<()> {
         .with_context(|| format!("loading {}", cfg_path.display()))?;
     info!(path = %cfg_path.display(), bindings = cfg.bindings.len(), "loaded config");
 
-    let summoner = Arc::new(Mutex::new(Summoner::new(&cfg)));
-    let registry = Arc::new(Mutex::new(HotkeyRegistry::new()?));
-    registry
-        .lock()
-        .unwrap()
-        .register_all(&cfg.bindings)
-        .context("registering hotkeys")?;
-
     write_pid_file()?;
-    install_signal_handlers()?;
 
     info!(pid = std::process::id(), "summon daemon running");
 
     #[cfg(target_os = "macos")]
     {
-        // Spawn worker BEFORE the NSApplication runloop blocks the main thread.
-        let s_w = Arc::clone(&summoner);
-        let r_w = Arc::clone(&registry);
-        std::thread::spawn(move || worker_loop(s_w, r_w, cfg_path));
+        let summoner = Summoner::new(&cfg);
+        let mut registry = HotkeyRegistry::new()?;
+        registry
+            .register_all(&cfg.bindings)
+            .context("registering hotkeys")?;
 
-        // Block main thread on NSApp.run — this is what actually pumps Carbon
-        // hotkey events. CFRunLoop alone doesn't dispatch them.
+        STATE
+            .set(Mutex::new(State {
+                summoner,
+                registry,
+                cfg_path,
+            }))
+            .ok()
+            .expect("STATE initialized twice");
+
+        install_signal_sources();
+        spawn_hotkey_forwarder();
+
+        // Block main thread on NSApp.run — pumps Carbon hotkey events,
+        // dispatches signal sources, runs blocks posted to the main queue.
         run_nsapp();
-        // Unreachable in normal operation; STOP path exits via worker.
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = registry;
-        let _ = summoner;
+        let _ = cfg;
         let _ = cfg_path;
         eprintln!("summon: only macOS is supported");
     }
@@ -99,31 +115,10 @@ fn cleanup_pid_file() {
     }
 }
 
-#[cfg(unix)]
-fn install_signal_handlers() -> Result<()> {
-    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-    extern "C" fn on_hup(_: i32) {
-        RELOAD.store(true, Ordering::Relaxed);
-    }
-    extern "C" fn on_term(_: i32) {
-        STOP.store(true, Ordering::Relaxed);
-    }
-    let hup = SigAction::new(
-        SigHandler::Handler(on_hup),
-        SaFlags::SA_RESTART,
-        SigSet::empty(),
-    );
-    let term = SigAction::new(
-        SigHandler::Handler(on_term),
-        SaFlags::empty(),
-        SigSet::empty(),
-    );
-    unsafe {
-        sigaction(Signal::SIGHUP, &hup)?;
-        sigaction(Signal::SIGTERM, &term)?;
-        sigaction(Signal::SIGINT, &term)?;
-    }
-    Ok(())
+#[cfg(target_os = "macos")]
+fn is_foreground() -> bool {
+    use std::os::fd::AsRawFd;
+    unsafe { libc::isatty(std::io::stderr().as_raw_fd()) == 1 }
 }
 
 #[cfg(target_os = "macos")]
@@ -138,68 +133,100 @@ fn run_nsapp() {
     }
 }
 
+/// Bridge global-hotkey's crossbeam channel onto the main queue. The
+/// thread does a blocking `recv` — no polling, no wakeups when idle. On
+/// each event it boxes the id and hands ownership to `dispatch_async_f`,
+/// which runs `on_hotkey_main` on the main thread.
 #[cfg(target_os = "macos")]
-fn worker_loop(
-    summoner: Arc<Mutex<Summoner>>,
-    registry: Arc<Mutex<HotkeyRegistry>>,
-    cfg_path: PathBuf,
-) {
+fn spawn_hotkey_forwarder() {
+    use crate::macos::dispatch;
     use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
-    use std::time::Duration;
 
-    let receiver = GlobalHotKeyEvent::receiver();
-    loop {
-        if STOP.load(Ordering::Relaxed) {
-            info!("SIGTERM received; shutting down");
-            cleanup_pid_file();
-            registry.lock().unwrap().unregister_all();
-            std::process::exit(0);
-        }
-        if RELOAD.swap(false, Ordering::Relaxed) {
-            handle_reload(&summoner, &registry, &cfg_path);
-        }
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(event) => {
-                if event.state == HotKeyState::Pressed {
-                    let ident = registry
-                        .lock()
-                        .unwrap()
-                        .app_for(event.id)
-                        .map(str::to_owned);
-                    if let Some(ident) = ident {
-                        info!(ident, id = event.id, "hotkey fired");
-                        let mut s = summoner.lock().unwrap();
-                        let result = s.summon(&ident);
-                        if let Err(e) = result {
-                            warn!(ident, "summon failed: {e:#}");
+    std::thread::Builder::new()
+        .name("summon-hotkey-forwarder".into())
+        .spawn(|| {
+            let receiver = GlobalHotKeyEvent::receiver();
+            loop {
+                match receiver.recv() {
+                    Ok(event) => {
+                        if event.state == HotKeyState::Pressed {
+                            let ctx = Box::into_raw(Box::new(event.id)) as *mut std::ffi::c_void;
+                            unsafe { dispatch::async_to_main(ctx, on_hotkey_main) };
                         }
-                    } else {
-                        warn!(id = event.id, "unmapped hotkey event");
+                    }
+                    Err(e) => {
+                        error!("hotkey channel closed: {e}");
+                        return;
                     }
                 }
             }
-            Err(_) => continue,
-        }
-    }
+        })
+        .expect("spawning hotkey forwarder thread");
 }
 
 #[cfg(target_os = "macos")]
-fn handle_reload(
-    summoner: &Arc<Mutex<Summoner>>,
-    registry: &Arc<Mutex<HotkeyRegistry>>,
-    cfg_path: &std::path::Path,
-) {
+extern "C" fn on_hotkey_main(ctx: *mut std::ffi::c_void) {
+    let id = unsafe { *Box::from_raw(ctx as *mut u32) };
+    let Some(state_lock) = STATE.get() else {
+        return;
+    };
+    let mut state = state_lock.lock().unwrap();
+    let ident = state.registry.app_for(id).map(str::to_owned);
+    match ident {
+        Some(ident) => {
+            info!(ident, id, "hotkey fired");
+            if let Err(e) = state.summoner.summon(&ident) {
+                warn!(ident, "summon failed: {e:#}");
+            }
+        }
+        None => warn!(id, "unmapped hotkey event"),
+    }
+}
+
+/// Set SIGHUP/SIGTERM/SIGINT to SIG_IGN so default disposition can't
+/// terminate the daemon, then attach a libdispatch signal source per
+/// signal. Sources observe via kqueue regardless of disposition; handlers
+/// run on the main queue, serialized with hotkey handlers.
+#[cfg(target_os = "macos")]
+fn install_signal_sources() {
+    use crate::macos::dispatch;
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+    }
+    dispatch::install_signal_handler(libc::SIGHUP, on_sighup);
+    dispatch::install_signal_handler(libc::SIGTERM, on_shutdown);
+    dispatch::install_signal_handler(libc::SIGINT, on_shutdown);
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn on_sighup(_ctx: *mut std::ffi::c_void) {
     info!("SIGHUP received; reloading config");
-    match crate::config::load(cfg_path) {
+    let Some(state_lock) = STATE.get() else {
+        return;
+    };
+    let mut state = state_lock.lock().unwrap();
+    let cfg_path = state.cfg_path.clone();
+    match crate::config::load(&cfg_path) {
         Ok(new_cfg) => {
-            let mut r = registry.lock().unwrap();
-            r.unregister_all();
-            if let Err(e) = r.register_all(&new_cfg.bindings) {
+            state.registry.unregister_all();
+            if let Err(e) = state.registry.register_all(&new_cfg.bindings) {
                 error!("re-registering hotkeys after reload: {e:#}");
             }
-            summoner.lock().unwrap().reconfigure(&new_cfg);
+            state.summoner.reconfigure(&new_cfg);
             info!(bindings = new_cfg.bindings.len(), "reload complete");
         }
         Err(e) => error!("reload: failed to parse config: {e:#}"),
     }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn on_shutdown(_ctx: *mut std::ffi::c_void) {
+    info!("SIGTERM/SIGINT received; shutting down");
+    if let Some(state_lock) = STATE.get() {
+        state_lock.lock().unwrap().registry.unregister_all();
+    }
+    cleanup_pid_file();
+    std::process::exit(0);
 }

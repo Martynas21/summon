@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Wraps `cargo build --release` + ad-hoc codesign with a STABLE identifier.
+# Wraps `cargo build --release` + ad-hoc codesign with a STABLE identifier
+# AND a stable DESIGNATED REQUIREMENT.
 #
-# Why: macOS Accessibility (TCC) keys trust by code-signing identifier. Rust's
-# default ad-hoc signing produces an identifier with a random suffix per build
-# (e.g. "summon-d0733a5f438274c9"), so every rebuild silently invalidates the
-# user's existing Accessibility grant. Forcing a fixed identifier means the
-# user grants once and the trust survives all future builds.
+# Why: macOS TCC (Accessibility) records the binary's designated requirement
+# when the user first grants access. With plain ad-hoc signing, the default
+# designated requirement is the binary's CDHash — content-derived, so every
+# rebuild produces a new requirement and TCC silently treats the rebuilt
+# binary as untrusted (matches the saved identifier, but the embedded
+# requirement is now different).
+#
+# Forcing a custom designated requirement of `identifier "dev.summon.daemon"`
+# means TCC stores an identifier-based requirement, which any future build
+# with the same identifier will satisfy regardless of CDHash. Grant once,
+# trust survives subsequent rebuilds.
 
 cd "$(dirname "$0")/.."
 
@@ -20,8 +27,21 @@ cargo build --release "$@"
 BIN="$(pwd)/target/release/summon"
 IDENT="dev.summon.daemon"
 
-codesign --force --identifier "$IDENT" --sign - "$BIN"
+REQS="$(mktemp)"
+trap 'rm -f "$REQS"' EXIT
+cat >"$REQS" <<EOF
+designated => identifier "$IDENT"
+EOF
+
+codesign --force \
+    --identifier "$IDENT" \
+    --requirements "$REQS" \
+    --sign - \
+    "$BIN"
 
 echo
 echo "built and signed:"
 codesign -dv "$BIN" 2>&1 | grep -E '^Identifier|^CDHash'
+echo
+echo "designated requirement:"
+codesign -d -r- "$BIN" 2>&1 | grep -E '^designated' || true

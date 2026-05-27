@@ -16,6 +16,29 @@ pub fn running_pid() -> Result<u32> {
     Ok(pid)
 }
 
+/// Send SIGTERM to the running daemon. If a LaunchAgent is installed,
+/// `KeepAlive=true` will cause launchd to restart it immediately — surface
+/// that so the user picks `summon uninstall` if they wanted a permanent stop.
+pub fn stop() -> Result<()> {
+    let pid = running_pid()?;
+    send_signal(pid, nix::sys::signal::Signal::SIGTERM)
+        .with_context(|| format!("sending SIGTERM to pid {pid}"))?;
+    println!("stop signal sent to pid {pid}");
+    if launch_agent_installed() {
+        println!(
+            "note: LaunchAgent is installed; launchd will restart the daemon.\n\
+             Use `summon uninstall` to stop it permanently."
+        );
+    }
+    Ok(())
+}
+
+fn launch_agent_installed() -> bool {
+    crate::paths::launch_agent_plist()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
 /// Send SIGHUP to the running daemon to trigger a config reload.
 /// Validates the config first so the user sees parse errors immediately
 /// (the daemon would have failed silently and kept the old config).
