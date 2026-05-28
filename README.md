@@ -11,9 +11,11 @@ You want `Ctrl+1` to always show Ghostty, `Ctrl+2` to always show Chrome, etc. E
 ## Install
 
 ```bash
-# 1. Build (requires Rust 1.95+)
+# 1. Build (requires Rust 1.95+). Use the script, not bare `cargo build`:
+#    it re-signs with a stable designated requirement so the macOS
+#    Accessibility grant survives future rebuilds.
 cd ~/Projects/summon
-cargo build --release
+./scripts/build.sh
 
 # 2. Put binary on PATH. ~/.local/bin works on user account; no sudo needed.
 mkdir -p ~/.local/bin

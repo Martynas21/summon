@@ -38,6 +38,18 @@ target/release/summon uninstall     # bootout + remove plist
 
 `tracing-subscriber` reads `RUST_LOG` (`EnvFilter`). Default is `info`. Daemon logs under launchd: `~/Library/Logs/summon/{stdout,stderr}.log`.
 
+## Deploying code changes to the running daemon
+
+`summon reload` is **SIGHUP only** — it re-reads `config.toml` and re-registers hotkeys, but does NOT swap the binary. To pick up code changes, you must restart the process so launchd respawns it from the new binary:
+
+```bash
+./scripts/build.sh        # rebuild + re-sign with stable identifier
+target/release/summon stop    # SIGTERM; KeepAlive=true → launchd respawns from new binary
+target/release/summon status  # verify new pid, AX still granted
+```
+
+Using `reload` after a rebuild is a silent footgun: the call succeeds, you see "reload signal sent", but the old code keeps running.
+
 ## Why `scripts/build.sh` exists (don't skip it)
 
 macOS TCC records the binary's *designated requirement* at first grant. Default ad-hoc codesign uses the CDHash → every rebuild invalidates the saved grant. The script forces `designated => identifier "dev.summon.daemon"`, so any future build with the same identifier inherits the existing Accessibility grant. **Use the script for any release build you intend to run, not bare `cargo build --release`.**

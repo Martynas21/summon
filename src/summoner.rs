@@ -117,7 +117,73 @@ impl Summoner {
                 if prev_ident == ident && now.duration_since(*prev_time) <= cycle_window
         );
 
-        let cursor = self.cursors.entry(ident.to_string()).or_insert(AppCursor {
+        // Minimize the previous frontmost BEFORE we touch the target's cursor
+        // or raise its window. Reversing the order makes the transition
+        // flicker: the target window pops in over the old one, then the old
+        // one minimizes behind it. AX per-window minimize (kAXMinimizedAttribute)
+        // rather than NSRunningApplication.hide() because hide() returns NO
+        // when the app is still active/transitioning (observed: Chrome,
+        // Edge, VSCode, Slack all rejected hide at the moment of the call).
+        // Done before taking the main cursor borrow so we can also update the
+        // prev app's cursor without two-mutable-borrows on self.cursors.
+        if !was_active && self.hide_previous && frontmost_pid > 0 && frontmost_pid != pid {
+            let prev_running = app::for_pid(frontmost_pid);
+            let prev_bid = prev_running
+                .as_ref()
+                .and_then(|a| app::bundle_id(a))
+                .unwrap_or_default();
+            let prev_name = prev_running
+                .as_ref()
+                .and_then(|a| app::name(a))
+                .unwrap_or_default();
+            if prev_bid == "com.apple.finder" {
+                info!(prev_pid = frontmost_pid, "skip minimize: finder");
+            } else if let Some(prev_app_el) = window::AppEl::for_pid(frontmost_pid) {
+                let prev_wins = window::windows(&prev_app_el);
+                // Topmost non-minimized window = user's last-active in prev app.
+                // Captured BEFORE we minimize so that on return we can restore
+                // *that* window rather than the cursor's stale last-raised,
+                // which the user may have manually minimized between presses.
+                let user_active = prev_wins
+                    .iter()
+                    .find(|w| !window::is_minimized(w))
+                    .and_then(|w| w.window_id());
+                let mut minimized = 0usize;
+                for w in &prev_wins {
+                    if !window::is_minimized(w) {
+                        window::minimize(w);
+                        minimized += 1;
+                    }
+                }
+                if let Some(id) = user_active {
+                    let key = cursor_key(&prev_bid, &prev_name);
+                    let entry =
+                        self.cursors.entry(key).or_insert(AppCursor {
+                            last_window: None,
+                            last_press: now,
+                        });
+                    entry.last_window = Some(id);
+                }
+                info!(
+                    prev_pid = frontmost_pid,
+                    bundle = %prev_bid,
+                    total = prev_wins.len(),
+                    minimized,
+                    user_active = ?user_active,
+                    "minimized previous"
+                );
+            } else {
+                warn!(prev_pid = frontmost_pid, "minimize: no AX element for prev pid");
+            }
+        }
+
+        // Cursors keyed by resolved app identity (bundle id, name fallback)
+        // rather than the user's binding string. This lets us update the
+        // cursor from the hide_previous path (where we know the prev app's
+        // bundle id but not which binding it maps to), and lets two bindings
+        // to the same app share window-history.
+        let key = cursor_key(&resolved_bundle, &resolved_name);
+        let cursor = self.cursors.entry(key).or_insert(AppCursor {
             last_window: None,
             last_press: now,
         });
@@ -132,39 +198,6 @@ impl Summoner {
         };
 
         let pick = &wins[idx];
-        // Minimize the previous frontmost BEFORE raising/activating the
-        // target. Reversing the order makes the transition flicker: the
-        // target window pops in over the old one, then the old one
-        // minimizes behind it. AX per-window minimize (kAXMinimizedAttribute)
-        // rather than NSRunningApplication.hide() because hide() returns NO
-        // when the app is still active/transitioning (observed: Chrome,
-        // Edge, VSCode, Slack all rejected hide at the moment of the call).
-        if !was_active && self.hide_previous && frontmost_pid > 0 && frontmost_pid != pid {
-            let prev_bid = app::for_pid(frontmost_pid)
-                .and_then(|a| app::bundle_id(&a))
-                .unwrap_or_default();
-            if prev_bid == "com.apple.finder" {
-                info!(prev_pid = frontmost_pid, "skip minimize: finder");
-            } else if let Some(prev_app_el) = window::AppEl::for_pid(frontmost_pid) {
-                let prev_wins = window::windows(&prev_app_el);
-                let mut minimized = 0usize;
-                for w in &prev_wins {
-                    if !window::is_minimized(w) {
-                        window::minimize(w);
-                        minimized += 1;
-                    }
-                }
-                info!(
-                    prev_pid = frontmost_pid,
-                    bundle = %prev_bid,
-                    total = prev_wins.len(),
-                    minimized,
-                    "minimized previous"
-                );
-            } else {
-                warn!(prev_pid = frontmost_pid, "minimize: no AX element for prev pid");
-            }
-        }
         if window::is_minimized(pick) {
             window::unminimize(pick);
         }
@@ -241,6 +274,14 @@ impl Summoner {
     #[cfg(not(target_os = "macos"))]
     pub fn minimize_frontmost(&mut self, _ident: &str) -> Result<()> {
         anyhow::bail!("minimize_frontmost is macOS-only");
+    }
+}
+
+fn cursor_key(bundle_id: &str, name: &str) -> String {
+    if !bundle_id.is_empty() {
+        bundle_id.to_string()
+    } else {
+        name.to_string()
     }
 }
 
