@@ -57,6 +57,9 @@ Lives at `~/.config/summon/config.toml`. See [`examples/config.toml`](examples/c
 ```toml
 [settings]
 cycle_reset_ms = 0       # Reset cycle cursor after N ms idle. 0 = never.
+hold_threshold_ms = 0    # Hold a hotkey ≥N ms to minimize the app's
+                         # frontmost window (no focus change). 0 = disabled.
+                         # Recommended: 200.
 
 [bindings]
 "ctrl+1" = "com.mitchellh.ghostty"   # by bundle id (preferred)

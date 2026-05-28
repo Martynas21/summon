@@ -14,6 +14,15 @@ unsafe extern "C" {
         work: extern "C" fn(*mut c_void),
     );
 
+    fn dispatch_time(when: u64, delta: i64) -> u64;
+
+    fn dispatch_after_f(
+        when: u64,
+        queue: *mut c_void,
+        context: *mut c_void,
+        work: extern "C" fn(*mut c_void),
+    );
+
     fn dispatch_source_create(
         ty: *const c_void,
         handle: usize,
@@ -29,6 +38,8 @@ unsafe extern "C" {
     fn dispatch_resume(object: *mut c_void);
 }
 
+const DISPATCH_TIME_NOW: u64 = 0;
+
 fn main_queue() -> *mut c_void {
     (&raw const DISPATCH_MAIN_Q) as *mut c_void
 }
@@ -38,6 +49,13 @@ fn main_queue() -> *mut c_void {
 /// the handler).
 pub unsafe fn async_to_main(ctx: *mut c_void, work: extern "C" fn(*mut c_void)) {
     unsafe { dispatch_async_f(main_queue(), ctx, work) };
+}
+
+/// Schedule `work` on the main queue after `ms` milliseconds. Same context
+/// ownership rules as `async_to_main`.
+pub unsafe fn after_main_ms(ms: u64, ctx: *mut c_void, work: extern "C" fn(*mut c_void)) {
+    let when = unsafe { dispatch_time(DISPATCH_TIME_NOW, (ms as i64) * 1_000_000) };
+    unsafe { dispatch_after_f(when, main_queue(), ctx, work) };
 }
 
 /// Install a libdispatch signal source on the main queue. The default

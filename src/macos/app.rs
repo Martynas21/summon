@@ -117,6 +117,17 @@ pub fn pid(app: &NSRunningApplication) -> i32 {
     unsafe { app.processIdentifier() }
 }
 
+/// Hide app (Cmd+H equivalent). All windows go away; app stays running.
+/// Returns the API's bool result so callers can log/trace it.
+pub fn hide(app: &NSRunningApplication) -> bool {
+    unsafe { app.hide() }
+}
+
+/// Look up the NSRunningApplication for a given pid.
+pub fn for_pid(pid: i32) -> Option<Retained<NSRunningApplication>> {
+    unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) }
+}
+
 /// PID of whichever app currently has the frontmost window. Callers needing
 /// "is this app active" should compare this against the app's PID directly,
 /// reusing a single `frontmost_pid()` call rather than making two ObjC

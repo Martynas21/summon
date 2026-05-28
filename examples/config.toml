@@ -12,6 +12,10 @@
 [settings]
 # Reset the per-app cycle cursor after N ms of inactivity. 0 = never reset.
 cycle_reset_ms = 0
+# Hold a hotkey for ≥N ms (no key release) to minimize the bound app's
+# frontmost window. No focus change, no activation. 0 = disabled.
+# Recommended: 200.
+hold_threshold_ms = 0
 
 [bindings]
 "ctrl+1" = "com.mitchellh.ghostty"   # Ghostty terminal

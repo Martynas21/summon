@@ -17,6 +17,16 @@ pub struct Settings {
     /// Reset cycle cursor after this many ms of inactivity. 0 = never reset.
     #[serde(default)]
     pub cycle_reset_ms: u64,
+    /// Hide previously-frontmost app (Cmd+H equivalent) when switching to a
+    /// different app via summon. Skipped when cycling within the same app
+    /// and when the frontmost is Finder.
+    #[serde(default)]
+    pub hide_previous: bool,
+    /// Hold any hotkey this many ms (no key release) to minimize the bound
+    /// app's frontmost window. 0 disables hold detection and restores
+    /// zero-latency summon on key press. Recommended value: 200.
+    #[serde(default)]
+    pub hold_threshold_ms: u64,
 }
 
 /// Binding value supports either a bare string (app identifier) or a table form
@@ -209,7 +219,18 @@ mod tests {
         let src = "";
         let cfg = parse_str(src).unwrap();
         assert_eq!(cfg.settings.cycle_reset_ms, 0);
+        assert_eq!(cfg.settings.hold_threshold_ms, 0);
         assert!(cfg.bindings.is_empty());
+    }
+
+    #[test]
+    fn parses_hold_threshold() {
+        let src = r#"
+            [settings]
+            hold_threshold_ms = 250
+        "#;
+        let cfg = parse_str(src).unwrap();
+        assert_eq!(cfg.settings.hold_threshold_ms, 250);
     }
 
     #[test]

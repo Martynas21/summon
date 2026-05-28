@@ -28,6 +28,9 @@ pub enum Cmd {
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
     },
+    /// Open the config file in $EDITOR (or $VISUAL, or TextEdit). Reloads
+    /// the daemon after the editor exits if the config still parses.
+    Edit,
     /// Internal: launchd-spawned helper that fires the TCC modal under
     /// launchd attribution. Not for direct use.
     #[command(name = "_grant", hide = true)]
@@ -43,6 +46,7 @@ pub fn run(args: Cli) -> Result<()> {
         Cmd::Stop => crate::ipc::stop(),
         Cmd::Status => status(),
         Cmd::Validate { path } => validate(path),
+        Cmd::Edit => edit(),
         Cmd::Grant => crate::launchd::grant(),
     }
 }
@@ -76,5 +80,66 @@ fn validate(path: Option<PathBuf>) -> Result<()> {
     };
     let cfg = crate::config::load(&path)?;
     println!("ok: {} bindings", cfg.bindings.len());
+    Ok(())
+}
+
+fn edit() -> Result<()> {
+    use anyhow::{anyhow, Context};
+    use std::process::Command;
+
+    let path = crate::paths::config_file()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if !path.exists() {
+        std::fs::write(&path, "[settings]\n\n[bindings]\n")
+            .with_context(|| format!("creating {}", path.display()))?;
+    }
+
+    let editor = std::env::var("EDITOR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("VISUAL").ok().filter(|s| !s.is_empty()));
+
+    let status = match editor {
+        Some(cmd) => {
+            // Honour $EDITOR with args (e.g. "code --wait"). Splitting on
+            // whitespace mirrors what git and other tools do — good enough
+            // for the common cases, no shell-injection surface.
+            let mut parts = cmd.split_whitespace();
+            let prog = parts
+                .next()
+                .ok_or_else(|| anyhow!("EDITOR is empty after split"))?;
+            Command::new(prog)
+                .args(parts)
+                .arg(&path)
+                .status()
+                .with_context(|| format!("spawning editor: {cmd}"))?
+        }
+        None => Command::new("/usr/bin/open")
+            .arg("-t")
+            .arg("-W")
+            .arg(&path)
+            .status()
+            .context("spawning `open -t`")?,
+    };
+    if !status.success() {
+        return Err(anyhow!("editor exited with {status}"));
+    }
+
+    match crate::config::load(&path) {
+        Ok(cfg) => {
+            println!("ok: {} bindings", cfg.bindings.len());
+            if crate::ipc::running_pid().is_ok() {
+                crate::ipc::reload()?;
+                println!("reloaded");
+            }
+        }
+        Err(e) => {
+            eprintln!("config invalid, daemon NOT reloaded: {e}");
+            return Err(e);
+        }
+    }
     Ok(())
 }

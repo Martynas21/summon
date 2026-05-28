@@ -12,6 +12,11 @@ struct State {
     summoner: Summoner,
     registry: HotkeyRegistry,
     cfg_path: PathBuf,
+    /// Hotkey ids currently in their Press→(Release|threshold) window. Empty
+    /// when hold-to-minimize is disabled. Entries are removed by whichever
+    /// of the release handler or the threshold timer wins; the other branch
+    /// then no-ops.
+    pending_holds: std::collections::HashMap<u32, ()>,
 }
 
 #[cfg(target_os = "macos")]
@@ -69,6 +74,7 @@ pub fn run() -> Result<()> {
                 summoner,
                 registry,
                 cfg_path,
+                pending_holds: std::collections::HashMap::new(),
             }))
             .ok()
             .expect("STATE initialized twice");
@@ -134,9 +140,9 @@ fn run_nsapp() {
 }
 
 /// Bridge global-hotkey's crossbeam channel onto the main queue. The
-/// thread does a blocking `recv` — no polling, no wakeups when idle. On
-/// each event it boxes the id and hands ownership to `dispatch_async_f`,
-/// which runs `on_hotkey_main` on the main thread.
+/// thread does a blocking `recv` — no polling, no wakeups when idle. Press
+/// and Release events are routed to separate main-thread handlers so the
+/// hold detector can run without bit-packing state into the context pointer.
 #[cfg(target_os = "macos")]
 fn spawn_hotkey_forwarder() {
     use crate::macos::dispatch;
@@ -149,13 +155,17 @@ fn spawn_hotkey_forwarder() {
             loop {
                 match receiver.recv() {
                     Ok(event) => {
-                        if event.state == HotKeyState::Pressed {
-                            // Embed the u32 hotkey id directly in the
-                            // context pointer (always 64-bit on macOS).
-                            // Avoids a per-press heap alloc on the forwarder
-                            // thread and a Box::from_raw on the main thread.
-                            let ctx = event.id as usize as *mut std::ffi::c_void;
-                            unsafe { dispatch::async_to_main(ctx, on_hotkey_main) };
+                        // Embed the u32 hotkey id directly in the context
+                        // pointer (always 64-bit on macOS). Avoids a per-event
+                        // heap alloc on the forwarder thread.
+                        let ctx = event.id as usize as *mut std::ffi::c_void;
+                        match event.state {
+                            HotKeyState::Pressed => unsafe {
+                                dispatch::async_to_main(ctx, on_hotkey_press_main)
+                            },
+                            HotKeyState::Released => unsafe {
+                                dispatch::async_to_main(ctx, on_hotkey_release_main)
+                            },
                         }
                     }
                     Err(e) => {
@@ -169,21 +179,79 @@ fn spawn_hotkey_forwarder() {
 }
 
 #[cfg(target_os = "macos")]
-extern "C" fn on_hotkey_main(ctx: *mut std::ffi::c_void) {
+extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
+    use crate::macos::dispatch;
     let id = ctx as usize as u32;
     let Some(state_lock) = STATE.get() else {
         return;
     };
     let mut state = state_lock.lock().unwrap();
-    let ident = state.registry.app_for(id).map(str::to_owned);
-    match ident {
-        Some(ident) => {
-            info!(ident, id, "hotkey fired");
+    let Some(ident) = state.registry.app_for(id).map(str::to_owned) else {
+        warn!(id, "unmapped hotkey press");
+        return;
+    };
+    let threshold = state.summoner.hold_threshold();
+    match threshold {
+        None => {
+            info!(ident, id, "hotkey press (hold disabled)");
             if let Err(e) = state.summoner.summon(&ident) {
                 warn!(ident, "summon failed: {e:#}");
             }
         }
-        None => warn!(id, "unmapped hotkey event"),
+        Some(d) => {
+            if state.pending_holds.contains_key(&id) {
+                // Auto-repeat from the OS. The first press is still in flight;
+                // ignore the duplicate so we don't reschedule a second timer.
+                return;
+            }
+            state.pending_holds.insert(id, ());
+            info!(ident, id, threshold_ms = d.as_millis() as u64, "hotkey press (pending)");
+            drop(state);
+            unsafe { dispatch::after_main_ms(d.as_millis() as u64, ctx, on_hold_fire) };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
+    let id = ctx as usize as u32;
+    let Some(state_lock) = STATE.get() else {
+        return;
+    };
+    let mut state = state_lock.lock().unwrap();
+    if state.pending_holds.remove(&id).is_none() {
+        // Timer already fired (or hold disabled — release wasn't tracked).
+        return;
+    }
+    let Some(ident) = state.registry.app_for(id).map(str::to_owned) else {
+        warn!(id, "unmapped hotkey release");
+        return;
+    };
+    info!(ident, id, "hotkey released → summon");
+    if let Err(e) = state.summoner.summon(&ident) {
+        warn!(ident, "summon failed: {e:#}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn on_hold_fire(ctx: *mut std::ffi::c_void) {
+    let id = ctx as usize as u32;
+    let Some(state_lock) = STATE.get() else {
+        return;
+    };
+    let mut state = state_lock.lock().unwrap();
+    if state.pending_holds.remove(&id).is_none() {
+        // Released before threshold (handled by release path) — or reload
+        // cleared the map. Either way, no-op.
+        return;
+    }
+    let Some(ident) = state.registry.app_for(id).map(str::to_owned) else {
+        warn!(id, "hold fired for unmapped id");
+        return;
+    };
+    info!(ident, id, "hold threshold elapsed → minimize");
+    if let Err(e) = state.summoner.minimize_frontmost(&ident) {
+        warn!(ident, "minimize_frontmost failed: {e:#}");
     }
 }
 
@@ -219,6 +287,11 @@ extern "C" fn on_sighup(_ctx: *mut std::ffi::c_void) {
                 error!("re-registering hotkeys after reload: {e:#}");
             }
             state.summoner.reconfigure(&new_cfg);
+            // Hotkey ids are assigned by global-hotkey at register time, so
+            // post-reload they may map to different bindings. Discard any
+            // in-flight hold state — pending timers fired afterwards will
+            // find nothing and no-op.
+            state.pending_holds.clear();
             info!(bindings = new_cfg.bindings.len(), "reload complete");
         }
         Err(e) => error!("reload: failed to parse config: {e:#}"),

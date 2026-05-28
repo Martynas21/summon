@@ -25,6 +25,10 @@ pub struct Summoner {
     /// Max gap between two same-hotkey presses for the second to count as
     /// a cycle continuation.
     cycle_window: Duration,
+    hide_previous: bool,
+    /// `Some(d)` enables hold-to-minimize after `d`. `None` disables it and
+    /// keeps summon firing on key Press.
+    hold_threshold: Option<Duration>,
 }
 
 impl Summoner {
@@ -33,12 +37,20 @@ impl Summoner {
             cursors: HashMap::new(),
             last_press: None,
             cycle_window: derive_cycle_window(cfg.settings.cycle_reset_ms),
+            hide_previous: cfg.settings.hide_previous,
+            hold_threshold: derive_hold_threshold(cfg.settings.hold_threshold_ms),
         }
     }
 
     pub fn reconfigure(&mut self, cfg: &ParsedConfig) {
         self.cycle_window = derive_cycle_window(cfg.settings.cycle_reset_ms);
+        self.hide_previous = cfg.settings.hide_previous;
+        self.hold_threshold = derive_hold_threshold(cfg.settings.hold_threshold_ms);
         // Keep cursor map across reloads so the user doesn't lose their place.
+    }
+
+    pub fn hold_threshold(&self) -> Option<Duration> {
+        self.hold_threshold
     }
 
     #[cfg(target_os = "macos")]
@@ -120,6 +132,39 @@ impl Summoner {
         };
 
         let pick = &wins[idx];
+        // Minimize the previous frontmost BEFORE raising/activating the
+        // target. Reversing the order makes the transition flicker: the
+        // target window pops in over the old one, then the old one
+        // minimizes behind it. AX per-window minimize (kAXMinimizedAttribute)
+        // rather than NSRunningApplication.hide() because hide() returns NO
+        // when the app is still active/transitioning (observed: Chrome,
+        // Edge, VSCode, Slack all rejected hide at the moment of the call).
+        if !was_active && self.hide_previous && frontmost_pid > 0 && frontmost_pid != pid {
+            let prev_bid = app::for_pid(frontmost_pid)
+                .and_then(|a| app::bundle_id(&a))
+                .unwrap_or_default();
+            if prev_bid == "com.apple.finder" {
+                info!(prev_pid = frontmost_pid, "skip minimize: finder");
+            } else if let Some(prev_app_el) = window::AppEl::for_pid(frontmost_pid) {
+                let prev_wins = window::windows(&prev_app_el);
+                let mut minimized = 0usize;
+                for w in &prev_wins {
+                    if !window::is_minimized(w) {
+                        window::minimize(w);
+                        minimized += 1;
+                    }
+                }
+                info!(
+                    prev_pid = frontmost_pid,
+                    bundle = %prev_bid,
+                    total = prev_wins.len(),
+                    minimized,
+                    "minimized previous"
+                );
+            } else {
+                warn!(prev_pid = frontmost_pid, "minimize: no AX element for prev pid");
+            }
+        }
         if window::is_minimized(pick) {
             window::unminimize(pick);
         }
@@ -155,6 +200,48 @@ impl Summoner {
     pub fn summon(&mut self, _ident: &str) -> Result<()> {
         anyhow::bail!("summon is macOS-only");
     }
+
+    /// Minimize the frontmost window of `ident`'s app. No focus change, no
+    /// activation, no cycle-state mutation. No-op if the app isn't running,
+    /// has no enumerable windows, or its front window is already minimized.
+    #[cfg(target_os = "macos")]
+    pub fn minimize_frontmost(&mut self, ident: &str) -> Result<()> {
+        let running = match app::find_running(ident) {
+            Some(a) => a,
+            None => {
+                info!(ident, "minimize: app not running");
+                return Ok(());
+            }
+        };
+        let pid = app::pid(&running);
+        let app_el = match window::AppEl::for_pid(pid) {
+            Some(e) => e,
+            None => {
+                warn!(ident, pid, "minimize: no AX element");
+                return Ok(());
+            }
+        };
+        let wins = window::windows(&app_el);
+        let front = match wins.first() {
+            Some(w) => w,
+            None => {
+                info!(ident, "minimize: no enumerable windows");
+                return Ok(());
+            }
+        };
+        if window::is_minimized(front) {
+            info!(ident, "minimize: front already minimized");
+            return Ok(());
+        }
+        window::minimize(front);
+        info!(ident, pid, total = wins.len(), "minimized frontmost");
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn minimize_frontmost(&mut self, _ident: &str) -> Result<()> {
+        anyhow::bail!("minimize_frontmost is macOS-only");
+    }
 }
 
 fn derive_cycle_window(configured_ms: u64) -> Duration {
@@ -163,5 +250,30 @@ fn derive_cycle_window(configured_ms: u64) -> Duration {
         Duration::from_millis(1500)
     } else {
         Duration::from_millis(configured_ms)
+    }
+}
+
+/// 0 means "disabled — fire summon on press, ignore release". Any positive
+/// value enables hold detection at that millisecond threshold.
+fn derive_hold_threshold(configured_ms: u64) -> Option<Duration> {
+    if configured_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(configured_ms))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hold_threshold_zero_is_disabled() {
+        assert_eq!(derive_hold_threshold(0), None);
+    }
+
+    #[test]
+    fn hold_threshold_positive_enables() {
+        assert_eq!(derive_hold_threshold(200), Some(Duration::from_millis(200)));
     }
 }

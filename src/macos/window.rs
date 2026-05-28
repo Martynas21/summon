@@ -1,8 +1,9 @@
 use accessibility_sys::{
-    kAXErrorSuccess, kAXFocusedAttribute, kAXMainAttribute, kAXMinimizedAttribute, kAXRaiseAction,
-    kAXStandardWindowSubrole, kAXSubroleAttribute, kAXTitleAttribute, kAXWindowsAttribute,
-    AXError, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
-    AXUIElementPerformAction, AXUIElementRef, AXUIElementSetAttributeValue,
+    kAXErrorSuccess, kAXFocusedAttribute, kAXHiddenAttribute, kAXMainAttribute,
+    kAXMinimizedAttribute, kAXRaiseAction, kAXStandardWindowSubrole, kAXSubroleAttribute,
+    kAXTitleAttribute, kAXWindowsAttribute, AXError, AXUIElementCopyAttributeValue,
+    AXUIElementCreateApplication, AXUIElementPerformAction, AXUIElementRef,
+    AXUIElementSetAttributeValue,
 };
 
 // Private but stable since macOS 10.x — used by yabai, Hammerspoon, Rectangle,
@@ -161,6 +162,33 @@ pub fn unminimize(window: &WindowEl) {
             attr.as_concrete_TypeRef(),
             kCFBooleanFalse as _,
         );
+    }
+}
+
+pub fn minimize(window: &WindowEl) {
+    let attr = cfstr(kAXMinimizedAttribute);
+    unsafe {
+        let _ = AXUIElementSetAttributeValue(
+            window.0,
+            attr.as_concrete_TypeRef(),
+            kCFBooleanTrue as _,
+        );
+    }
+}
+
+/// Set the app's AXHidden attribute. App-level equivalent of Cmd+H but
+/// instant (no miniaturize animation), and goes through AX so it works on
+/// the currently-active app where NSRunningApplication.hide() returns NO.
+/// Returns the AX error code (0 = success) so callers can log it.
+pub fn set_app_hidden(app: &AppEl, hidden: bool) -> AXError {
+    let attr = cfstr(kAXHiddenAttribute);
+    unsafe {
+        let value: CFTypeRef = if hidden {
+            kCFBooleanTrue as _
+        } else {
+            kCFBooleanFalse as _
+        };
+        AXUIElementSetAttributeValue(app.0, attr.as_concrete_TypeRef(), value)
     }
 }
 
