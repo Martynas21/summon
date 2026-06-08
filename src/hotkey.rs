@@ -6,10 +6,17 @@ use global_hotkey::{
 };
 use std::collections::HashMap;
 
+/// Per-binding resolution data the daemon needs when a hotkey fires.
+#[derive(Debug, Clone)]
+pub struct BindingTarget {
+    pub app: String,
+    pub cmdline_contains: Option<String>,
+}
+
 /// Owns the global-hotkey manager and remembers which app each hotkey ID maps to.
 pub struct HotkeyRegistry {
     manager: GlobalHotKeyManager,
-    id_to_app: HashMap<u32, String>,
+    id_to_target: HashMap<u32, BindingTarget>,
     registered: Vec<HotKey>,
 }
 
@@ -19,7 +26,7 @@ impl HotkeyRegistry {
             .map_err(|e| anyhow!("global hotkey manager init failed: {e:?}"))?;
         Ok(Self {
             manager,
-            id_to_app: HashMap::new(),
+            id_to_target: HashMap::new(),
             registered: Vec::new(),
         })
     }
@@ -34,7 +41,13 @@ impl HotkeyRegistry {
             self.manager
                 .register(hk)
                 .map_err(|e| anyhow!("register '{}': {e:?}", b.hotkey.raw))?;
-            self.id_to_app.insert(id, b.app.clone());
+            self.id_to_target.insert(
+                id,
+                BindingTarget {
+                    app: b.app.clone(),
+                    cmdline_contains: b.cmdline_contains.clone(),
+                },
+            );
             self.registered.push(hk);
         }
         Ok(())
@@ -45,11 +58,11 @@ impl HotkeyRegistry {
             let _ = self.manager.unregister_all(&self.registered);
         }
         self.registered.clear();
-        self.id_to_app.clear();
+        self.id_to_target.clear();
     }
 
-    pub fn app_for(&self, id: u32) -> Option<&str> {
-        self.id_to_app.get(&id).map(String::as_str)
+    pub fn target_for(&self, id: u32) -> Option<&BindingTarget> {
+        self.id_to_target.get(&id)
     }
 }
 

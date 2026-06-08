@@ -43,6 +43,12 @@ pub struct BindingFull {
     pub app: String,
     #[serde(default)]
     pub launch_args: Vec<String>,
+    /// Disambiguates multiple PIDs of the same bundle id (e.g. user's Chrome
+    /// vs Playwright/MCP Chrome with `--user-data-dir=...mcp-chrome-*`).
+    /// Substring match against any argv element of each candidate PID;
+    /// `None` keeps the legacy "first PID wins" behaviour.
+    #[serde(default)]
+    pub cmdline_contains: Option<String>,
 }
 
 impl BindingValue {
@@ -56,6 +62,12 @@ impl BindingValue {
         match self {
             BindingValue::Short(_) => &[],
             BindingValue::Full(f) => &f.launch_args,
+        }
+    }
+    pub fn cmdline_contains(&self) -> Option<&str> {
+        match self {
+            BindingValue::Short(_) => None,
+            BindingValue::Full(f) => f.cmdline_contains.as_deref(),
         }
     }
 }
@@ -72,6 +84,7 @@ pub struct ParsedBinding {
     pub hotkey: HotkeySpec,
     pub app: String,
     pub launch_args: Vec<String>,
+    pub cmdline_contains: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -118,6 +131,7 @@ pub fn parse_str(src: &str) -> Result<ParsedConfig> {
             hotkey,
             app: value.app().to_string(),
             launch_args: value.launch_args().to_vec(),
+            cmdline_contains: value.cmdline_contains().map(str::to_string),
         });
     }
     parsed.sort_by(|a, b| a.hotkey.raw.cmp(&b.hotkey.raw));
@@ -212,6 +226,27 @@ mod tests {
         assert_eq!(cfg.bindings[0].app, "Finder");
         assert_eq!(cfg.bindings[0].launch_args, vec!["--new"]);
         assert_eq!(cfg.bindings[0].hotkey.key, "f19");
+    }
+
+    #[test]
+    fn parses_cmdline_contains() {
+        let src = r#"
+            [bindings]
+            "ctrl+6" = { app = "com.google.Chrome", cmdline_contains = "mcp-chrome" }
+        "#;
+        let cfg = parse_str(src).unwrap();
+        assert_eq!(cfg.bindings[0].app, "com.google.Chrome");
+        assert_eq!(cfg.bindings[0].cmdline_contains.as_deref(), Some("mcp-chrome"));
+    }
+
+    #[test]
+    fn short_form_has_no_cmdline_filter() {
+        let src = r#"
+            [bindings]
+            "ctrl+1" = "Ghostty"
+        "#;
+        let cfg = parse_str(src).unwrap();
+        assert!(cfg.bindings[0].cmdline_contains.is_none());
     }
 
     #[test]

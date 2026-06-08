@@ -13,32 +13,80 @@ pub fn looks_like_bundle_id(s: &str) -> bool {
 
 /// Try bundle-id match first (if it looks like one), then localized-name fallback.
 pub fn find_running(ident: &str) -> Option<Retained<NSRunningApplication>> {
+    find_running_filtered(ident, None)
+}
+
+/// Same as `find_running` but with an optional argv substring filter. When
+/// `Some`, only PIDs whose argv contains the substring qualify — used to
+/// disambiguate multiple processes sharing one bundle id (Playwright Chrome
+/// vs the user's regular Chrome, Electron-based apps sharing
+/// `com.electron.*`, etc.). When `None`, behaviour is identical to the
+/// unfiltered lookup.
+pub fn find_running_filtered(
+    ident: &str,
+    cmdline_filter: Option<&str>,
+) -> Option<Retained<NSRunningApplication>> {
     if looks_like_bundle_id(ident) {
-        if let Some(app) = find_by_bundle_id(ident) {
+        if let Some(app) = find_by_bundle_id_filtered(ident, cmdline_filter) {
             return Some(app);
         }
     }
-    find_by_name(ident)
+    find_by_name_filtered(ident, cmdline_filter)
 }
 
 pub fn find_by_bundle_id(bid: &str) -> Option<Retained<NSRunningApplication>> {
+    find_by_bundle_id_filtered(bid, None)
+}
+
+pub fn find_by_bundle_id_filtered(
+    bid: &str,
+    cmdline_filter: Option<&str>,
+) -> Option<Retained<NSRunningApplication>> {
     // System-side filtered lookup beats iterating all running apps. O(1) vs
     // O(N) over the runningApplications array. Returns matches across all
-    // instances (Chrome can have several PIDs); we take the first.
+    // instances (Chrome can have several PIDs); pick the first that passes
+    // the optional argv filter.
     let ns = NSString::from_str(bid);
     let arr = unsafe { NSRunningApplication::runningApplicationsWithBundleIdentifier(&ns) };
-    if arr.count() == 0 {
-        None
-    } else {
-        Some(unsafe { arr.objectAtIndex(0) })
+    let n = arr.count();
+    if n == 0 {
+        return None;
     }
+    let Some(needle) = cmdline_filter else {
+        return Some(unsafe { arr.objectAtIndex(0) });
+    };
+    for i in 0..n {
+        let app: Retained<NSRunningApplication> = unsafe { arr.objectAtIndex(i) };
+        let pid = unsafe { app.processIdentifier() };
+        if crate::macos::proc::cmdline_contains(pid, needle) {
+            return Some(app);
+        }
+    }
+    None
 }
 
 pub fn find_by_name(name: &str) -> Option<Retained<NSRunningApplication>> {
+    find_by_name_filtered(name, None)
+}
+
+pub fn find_by_name_filtered(
+    name: &str,
+    cmdline_filter: Option<&str>,
+) -> Option<Retained<NSRunningApplication>> {
     for_each_app(|app| {
-        unsafe { app.localizedName() }
+        let name_match = unsafe { app.localizedName() }
             .map(|ns| ns.to_string().eq_ignore_ascii_case(name))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !name_match {
+            return false;
+        }
+        match cmdline_filter {
+            None => true,
+            Some(needle) => {
+                let pid = unsafe { app.processIdentifier() };
+                crate::macos::proc::cmdline_contains(pid, needle)
+            }
+        }
     })
 }
 
@@ -82,10 +130,18 @@ pub fn launch_and_wait(
     ident: &str,
     timeout: Duration,
 ) -> Result<Retained<NSRunningApplication>> {
+    launch_and_wait_filtered(ident, timeout, None)
+}
+
+pub fn launch_and_wait_filtered(
+    ident: &str,
+    timeout: Duration,
+    cmdline_filter: Option<&str>,
+) -> Result<Retained<NSRunningApplication>> {
     launch(ident)?;
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(app) = find_running(ident) {
+        if let Some(app) = find_running_filtered(ident, cmdline_filter) {
             return Ok(app);
         }
         if Instant::now() >= deadline {

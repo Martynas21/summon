@@ -1,6 +1,6 @@
 use crate::config::ParsedConfig;
 #[cfg(target_os = "macos")]
-use crate::macos::{app, window};
+use crate::macos::{app, screen, window};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -54,8 +54,8 @@ impl Summoner {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn summon(&mut self, ident: &str) -> Result<()> {
-        let running = match app::find_running(ident) {
+    pub fn summon(&mut self, ident: &str, cmdline_filter: Option<&str>) -> Result<()> {
+        let running = match app::find_running_filtered(ident, cmdline_filter) {
             Some(a) => a,
             None => {
                 // Fire-and-forget: `open` itself activates the app. Blocking
@@ -63,7 +63,17 @@ impl Summoner {
                 // causing every other hotkey press to queue behind it.
                 // The user's next press of this hotkey will be the cycle/focus
                 // path once the app is in runningApplications.
-                info!(ident, "launching (fire-and-forget)");
+                //
+                // When a cmdline_filter is set we still launch — but a fresh
+                // `open` will likely not produce a process matching the filter
+                // (those are typically spawned by Playwright/MCP, not the
+                // Launch Services route). Logged distinctly so users can spot
+                // the misconfiguration.
+                if cmdline_filter.is_some() {
+                    info!(ident, filter = ?cmdline_filter, "no PID matched cmdline filter; launching anyway");
+                } else {
+                    info!(ident, "launching (fire-and-forget)");
+                }
                 app::launch(ident)
                     .with_context(|| format!("launching {ident}"))?;
                 return Ok(());
@@ -117,16 +127,94 @@ impl Summoner {
                 if prev_ident == ident && now.duration_since(*prev_time) <= cycle_window
         );
 
-        // Minimize the previous frontmost BEFORE we touch the target's cursor
-        // or raise its window. Reversing the order makes the transition
-        // flicker: the target window pops in over the old one, then the old
-        // one minimizes behind it. AX per-window minimize (kAXMinimizedAttribute)
-        // rather than NSRunningApplication.hide() because hide() returns NO
-        // when the app is still active/transitioning (observed: Chrome,
-        // Edge, VSCode, Slack all rejected hide at the moment of the call).
-        // Done before taking the main cursor borrow so we can also update the
-        // prev app's cursor without two-mutable-borrows on self.cursors.
-        if !was_active && self.hide_previous && frontmost_pid > 0 && frontmost_pid != pid {
+        // Cursors keyed by resolved app identity (bundle id, name fallback)
+        // rather than the user's binding string. Two bindings to the same
+        // app share window-history.
+        let key = cursor_key(&resolved_bundle, &resolved_name);
+        let cursor_last = self.cursors.get(&key).and_then(|c| c.last_window);
+        let last_idx = cursor_last
+            .and_then(|id| wins.iter().position(|w| w.window_id() == Some(id)));
+
+        // Pick which window to raise/focus.
+        //
+        // Non-cycling priority, applied in order:
+        //   1. Visible window on the active display — user pressed there and
+        //      this app is already visible there; just focus it.
+        //   2. Cursor's last-raised IF on active display — preserves the
+        //      user's history on this monitor. Critical when hide_previous
+        //      has minimized multiple windows of the target app on this
+        //      display: AX order would pick arbitrarily; cursor remembers
+        //      which one was actually theirs.
+        //   3. Any minimized window on the active display — fresh fallback
+        //      when no cursor history points here (e.g. user pressed on B,
+        //      target is min'd on B, but they've never summoned it before).
+        //   4. Cursor's last-raised on any other display — target is fully
+        //      absent from active display; restore it where it was.
+        //   5. First visible window anywhere — no cursor, target not on
+        //      active display, but visible somewhere.
+        //   6. Index 0 — last-resort fallback.
+        //
+        // Cycle (is_rapid same hotkey) bypasses priority and advances the
+        // cursor through ALL windows (minimized picks get unminimized below).
+        let active = screen::active_display();
+        let on_active_visible = wins.iter().position(|w| {
+            !window::is_minimized(w) && screen::window_display(w) == Some(active)
+        });
+        let cursor_on_active =
+            last_idx.filter(|&i| screen::window_display(&wins[i]) == Some(active));
+        let on_active_minimized = wins.iter().position(|w| {
+            window::is_minimized(w) && screen::window_display(w) == Some(active)
+        });
+        let any_visible_idx = wins.iter().position(|w| !window::is_minimized(w));
+
+        let idx = if is_rapid && last_idx.is_some() && wins.len() > 1 {
+            (last_idx.unwrap() + 1) % wins.len()
+        } else {
+            on_active_visible
+                .or(cursor_on_active)
+                .or(on_active_minimized)
+                .or(last_idx)
+                .or(any_visible_idx)
+                .unwrap_or(0)
+        };
+
+        let pick = &wins[idx];
+        let was_minimized = window::is_minimized(pick);
+        let target_display = screen::window_display(pick);
+
+        // Same-app cycle: minimize the window we just advanced from. Without
+        // this, cycling within a multi-window app stacks visible windows on
+        // top of each other instead of swapping. Order: minimize prev BEFORE
+        // raising new pick to avoid pop-then-tuck flicker. The cross-app
+        // hide_previous block below does NOT cover this — it's gated on
+        // frontmost_pid != pid.
+        if is_rapid
+            && self.hide_previous
+            && wins.len() > 1
+            && last_idx.is_some()
+            && last_idx != Some(idx)
+        {
+            let prev_win = &wins[last_idx.unwrap()];
+            if !window::is_minimized(prev_win) {
+                window::minimize(prev_win);
+            }
+        }
+
+        // hide_previous fires only when the *picked window* was minimized
+        // before this press — i.e. we are actually surfacing something
+        // hidden. Picking an already-visible window means the user is just
+        // switching focus and should keep typing without prev getting
+        // cleared. Scope is the picked window's display: minimizing on a
+        // display where the target isn't appearing would be pointless.
+        // Order: minimize prev BEFORE raising target to avoid pop-then-tuck
+        // flicker. Captured before taking the cursor mutable borrow below so
+        // we can also update the prev app's cursor.
+        if was_minimized
+            && !was_active
+            && self.hide_previous
+            && frontmost_pid > 0
+            && frontmost_pid != pid
+        {
             let prev_running = app::for_pid(frontmost_pid);
             let prev_bid = prev_running
                 .as_ref()
@@ -138,30 +226,42 @@ impl Summoner {
                 .unwrap_or_default();
             if prev_bid == "com.apple.finder" {
                 info!(prev_pid = frontmost_pid, "skip minimize: finder");
+            } else if target_display.is_none() {
+                warn!(
+                    prev_pid = frontmost_pid,
+                    "skip minimize: target display unknown"
+                );
             } else if let Some(prev_app_el) = window::AppEl::for_pid(frontmost_pid) {
                 let prev_wins = window::windows(&prev_app_el);
-                // Topmost non-minimized window = user's last-active in prev app.
-                // Captured BEFORE we minimize so that on return we can restore
-                // *that* window rather than the cursor's stale last-raised,
-                // which the user may have manually minimized between presses.
+                let target_disp = target_display.unwrap();
+                // Topmost non-minimized window on the target's display = the
+                // user's last-active there. Captured BEFORE minimize so a
+                // future return restores that window rather than the stale
+                // cursor.
                 let user_active = prev_wins
                     .iter()
-                    .find(|w| !window::is_minimized(w))
+                    .find(|w| {
+                        !window::is_minimized(w)
+                            && screen::window_display(w) == Some(target_disp)
+                    })
                     .and_then(|w| w.window_id());
                 let mut minimized = 0usize;
                 for w in &prev_wins {
-                    if !window::is_minimized(w) {
-                        window::minimize(w);
-                        minimized += 1;
+                    if window::is_minimized(w) {
+                        continue;
                     }
+                    if screen::window_display(w) != Some(target_disp) {
+                        continue;
+                    }
+                    window::minimize(w);
+                    minimized += 1;
                 }
                 if let Some(id) = user_active {
-                    let key = cursor_key(&prev_bid, &prev_name);
-                    let entry =
-                        self.cursors.entry(key).or_insert(AppCursor {
-                            last_window: None,
-                            last_press: now,
-                        });
+                    let prev_key = cursor_key(&prev_bid, &prev_name);
+                    let entry = self.cursors.entry(prev_key).or_insert(AppCursor {
+                        last_window: None,
+                        last_press: now,
+                    });
                     entry.last_window = Some(id);
                 }
                 info!(
@@ -169,36 +269,16 @@ impl Summoner {
                     bundle = %prev_bid,
                     total = prev_wins.len(),
                     minimized,
+                    target_display = target_disp,
                     user_active = ?user_active,
-                    "minimized previous"
+                    "minimized previous (target-display scope)"
                 );
             } else {
                 warn!(prev_pid = frontmost_pid, "minimize: no AX element for prev pid");
             }
         }
 
-        // Cursors keyed by resolved app identity (bundle id, name fallback)
-        // rather than the user's binding string. This lets us update the
-        // cursor from the hide_previous path (where we know the prev app's
-        // bundle id but not which binding it maps to), and lets two bindings
-        // to the same app share window-history.
-        let key = cursor_key(&resolved_bundle, &resolved_name);
-        let cursor = self.cursors.entry(key).or_insert(AppCursor {
-            last_window: None,
-            last_press: now,
-        });
-        let last_idx = cursor
-            .last_window
-            .and_then(|id| wins.iter().position(|w| w.window_id() == Some(id)));
-
-        let idx = if is_rapid && last_idx.is_some() && wins.len() > 1 {
-            (last_idx.unwrap() + 1) % wins.len()
-        } else {
-            last_idx.unwrap_or(0)
-        };
-
-        let pick = &wins[idx];
-        if window::is_minimized(pick) {
+        if was_minimized {
             window::unminimize(pick);
         }
         window::focus(pick);
@@ -206,6 +286,11 @@ impl Summoner {
         if !was_active {
             app::activate(&running);
         }
+
+        let cursor = self.cursors.entry(key).or_insert(AppCursor {
+            last_window: None,
+            last_press: now,
+        });
         cursor.last_window = pick.window_id();
         cursor.last_press = now;
         self.last_press = Some((ident.to_string(), now));
@@ -223,6 +308,8 @@ impl Summoner {
             total = wins.len(),
             was_active,
             is_rapid,
+            was_minimized,
+            target_display = ?target_display,
             had_last = last_idx.is_some(),
             "summoned"
         );
@@ -230,7 +317,7 @@ impl Summoner {
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn summon(&mut self, _ident: &str) -> Result<()> {
+    pub fn summon(&mut self, _ident: &str, _cmdline_filter: Option<&str>) -> Result<()> {
         anyhow::bail!("summon is macOS-only");
     }
 
@@ -238,8 +325,8 @@ impl Summoner {
     /// activation, no cycle-state mutation. No-op if the app isn't running,
     /// has no enumerable windows, or its front window is already minimized.
     #[cfg(target_os = "macos")]
-    pub fn minimize_frontmost(&mut self, ident: &str) -> Result<()> {
-        let running = match app::find_running(ident) {
+    pub fn minimize_frontmost(&mut self, ident: &str, cmdline_filter: Option<&str>) -> Result<()> {
+        let running = match app::find_running_filtered(ident, cmdline_filter) {
             Some(a) => a,
             None => {
                 info!(ident, "minimize: app not running");
@@ -272,7 +359,7 @@ impl Summoner {
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn minimize_frontmost(&mut self, _ident: &str) -> Result<()> {
+    pub fn minimize_frontmost(&mut self, _ident: &str, _cmdline_filter: Option<&str>) -> Result<()> {
         anyhow::bail!("minimize_frontmost is macOS-only");
     }
 }

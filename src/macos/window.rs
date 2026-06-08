@@ -1,10 +1,13 @@
 use accessibility_sys::{
-    kAXErrorSuccess, kAXFocusedAttribute, kAXHiddenAttribute, kAXMainAttribute,
-    kAXMinimizedAttribute, kAXRaiseAction, kAXStandardWindowSubrole, kAXSubroleAttribute,
-    kAXTitleAttribute, kAXWindowsAttribute, AXError, AXUIElementCopyAttributeValue,
-    AXUIElementCreateApplication, AXUIElementPerformAction, AXUIElementRef,
-    AXUIElementSetAttributeValue,
+    kAXErrorSuccess, kAXFocusedAttribute, kAXFocusedWindowAttribute, kAXHiddenAttribute,
+    kAXMainAttribute, kAXMinimizedAttribute, kAXPositionAttribute, kAXRaiseAction,
+    kAXSizeAttribute, kAXStandardWindowSubrole, kAXSubroleAttribute, kAXTitleAttribute,
+    kAXWindowsAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize, AXError,
+    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementPerformAction,
+    AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
 };
+use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+use std::ffi::c_void;
 
 // Private but stable since macOS 10.x — used by yabai, Hammerspoon, Rectangle,
 // skhd. Maps an AXUIElement to its CGWindowID, which is the only identifier
@@ -201,6 +204,71 @@ pub fn raise(window: &WindowEl) {
 
 pub fn title(window: &WindowEl) -> Option<String> {
     copy_string_attr(window.0, kAXTitleAttribute)
+}
+
+/// AX position+size of a window, packed into a CGRect in Quartz (top-left
+/// origin) coordinates — the same coord space `CGDisplay::bounds` returns,
+/// so callers can do containment tests directly without flipping.
+pub fn frame(window: &WindowEl) -> Option<CGRect> {
+    let pos = copy_ax_point(window.0, kAXPositionAttribute)?;
+    let size = copy_ax_size(window.0, kAXSizeAttribute)?;
+    Some(CGRect::new(&pos, &size))
+}
+
+/// Frontmost focused window of an app (kAXFocusedWindow). None when the
+/// app has no focused window (background-only apps, or transient state).
+pub fn focused_window(app: &AppEl) -> Option<WindowEl> {
+    let attr = cfstr(kAXFocusedWindowAttribute);
+    let mut value: CFTypeRef = ptr::null();
+    let err = unsafe {
+        AXUIElementCopyAttributeValue(app.0, attr.as_concrete_TypeRef(), &mut value)
+    };
+    if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    Some(WindowEl(value as AXUIElementRef))
+}
+
+fn copy_ax_point(el: AXUIElementRef, key: &str) -> Option<CGPoint> {
+    let attr = cfstr(key);
+    let mut value: CFTypeRef = ptr::null();
+    let err = unsafe {
+        AXUIElementCopyAttributeValue(el, attr.as_concrete_TypeRef(), &mut value)
+    };
+    if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    let mut p = CGPoint::new(0.0, 0.0);
+    let ok = unsafe {
+        AXValueGetValue(
+            value as AXValueRef,
+            kAXValueTypeCGPoint,
+            &mut p as *mut _ as *mut c_void,
+        )
+    };
+    unsafe { CFRelease(value) };
+    if ok { Some(p) } else { None }
+}
+
+fn copy_ax_size(el: AXUIElementRef, key: &str) -> Option<CGSize> {
+    let attr = cfstr(key);
+    let mut value: CFTypeRef = ptr::null();
+    let err = unsafe {
+        AXUIElementCopyAttributeValue(el, attr.as_concrete_TypeRef(), &mut value)
+    };
+    if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    let mut s = CGSize::new(0.0, 0.0);
+    let ok = unsafe {
+        AXValueGetValue(
+            value as AXValueRef,
+            kAXValueTypeCGSize,
+            &mut s as *mut _ as *mut c_void,
+        )
+    };
+    unsafe { CFRelease(value) };
+    if ok { Some(s) } else { None }
 }
 
 /// Mark window as the app's main+focused window. Required when the app is

@@ -186,7 +186,11 @@ extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
         return;
     };
     let mut state = state_lock.lock().unwrap();
-    let Some(ident) = state.registry.app_for(id).map(str::to_owned) else {
+    let Some((ident, filter)) = state
+        .registry
+        .target_for(id)
+        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
+    else {
         warn!(id, "unmapped hotkey press");
         return;
     };
@@ -194,7 +198,7 @@ extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
     match threshold {
         None => {
             info!(ident, id, "hotkey press (hold disabled)");
-            if let Err(e) = state.summoner.summon(&ident) {
+            if let Err(e) = state.summoner.summon(&ident, filter.as_deref()) {
                 warn!(ident, "summon failed: {e:#}");
             }
         }
@@ -223,12 +227,16 @@ extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
         // Timer already fired (or hold disabled — release wasn't tracked).
         return;
     }
-    let Some(ident) = state.registry.app_for(id).map(str::to_owned) else {
+    let Some((ident, filter)) = state
+        .registry
+        .target_for(id)
+        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
+    else {
         warn!(id, "unmapped hotkey release");
         return;
     };
     info!(ident, id, "hotkey released → summon");
-    if let Err(e) = state.summoner.summon(&ident) {
+    if let Err(e) = state.summoner.summon(&ident, filter.as_deref()) {
         warn!(ident, "summon failed: {e:#}");
     }
 }
@@ -245,12 +253,16 @@ extern "C" fn on_hold_fire(ctx: *mut std::ffi::c_void) {
         // cleared the map. Either way, no-op.
         return;
     }
-    let Some(ident) = state.registry.app_for(id).map(str::to_owned) else {
+    let Some((ident, filter)) = state
+        .registry
+        .target_for(id)
+        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
+    else {
         warn!(id, "hold fired for unmapped id");
         return;
     };
     info!(ident, id, "hold threshold elapsed → minimize");
-    if let Err(e) = state.summoner.minimize_frontmost(&ident) {
+    if let Err(e) = state.summoner.minimize_frontmost(&ident, filter.as_deref()) {
         warn!(ident, "minimize_frontmost failed: {e:#}");
     }
 }

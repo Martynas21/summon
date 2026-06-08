@@ -21,3 +21,9 @@ hold_threshold_ms = 0
 "ctrl+1" = "com.mitchellh.ghostty"   # Ghostty terminal
 "ctrl+2" = "Google Chrome"           # by display name
 "ctrl+3" = "com.apple.finder"        # Finder
+
+# Multiple PIDs share one bundle id? Add `cmdline_contains` to pick the right
+# one. Useful for Playwright/MCP browsers that launch the system Chrome with a
+# private `--user-data-dir`. Substring is matched against any argv element of
+# each candidate PID.
+# "ctrl+6" = { app = "com.google.Chrome", cmdline_contains = "mcp-chrome" }
