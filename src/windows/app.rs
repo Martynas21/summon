@@ -188,16 +188,72 @@ fn exe_stem(path: &str) -> String {
         .unwrap_or_else(|| path.to_lowercase())
 }
 
-/// Returns (identifier, display_name) for all processes with visible windows.
-/// On Windows, identifier and display_name are both the lowercase exe stem.
+/// Returns (identifier, display_name) for all user-facing processes.
+/// Uses CreateToolhelp32Snapshot so apps that don't own a traditional top-level
+/// HWND (e.g. Ghostty, packaged apps) are still included.
 pub fn list_running_apps() -> Vec<(String, String)> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+    };
+    // TH32CS_SNAPPROCESS = 0x2 — snapshot of all processes in the system.
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() {
+        return Vec::new();
+    }
+
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
     let mut out: Vec<(String, String)> = Vec::new();
-    enumerate_pids(|_pid, path| {
-        let stem = exe_stem(&path);
-        out.push((stem.clone(), stem));
-        true
-    });
+    let mut seen = std::collections::HashSet::<String>::new();
+
+    if unsafe { Process32FirstW(snapshot, &mut entry) } != FALSE {
+        loop {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let raw = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            let stem = exe_stem(&raw.to_lowercase());
+
+            if !stem.is_empty() && !is_system_stem(&stem) {
+                if let Some(path) = exe_path_for_pid(entry.th32ProcessID) {
+                    if !is_windows_dir(&path) && seen.insert(stem.clone()) {
+                        out.push((stem.clone(), stem));
+                    }
+                }
+            }
+
+            if unsafe { Process32NextW(snapshot, &mut entry) } == FALSE {
+                break;
+            }
+        }
+    }
+
+    unsafe { CloseHandle(snapshot) };
     out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    out.dedup_by(|a, b| a.0 == b.0);
     out
+}
+
+fn is_system_stem(stem: &str) -> bool {
+    matches!(
+        stem,
+        "system" | "idle" | "registry" | "smss" | "csrss" | "wininit" | "winlogon"
+            | "lsass" | "services" | "svchost" | "dwm" | "conhost" | "searchindexer"
+            | "taskhostw" | "sihost" | "fontdrvhost" | "dllhost" | "ctfmon"
+            | "runtimebroker" | "applicationframehost" | "searchhost" | "spoolsv"
+            | "wudfhost" | "msdtc" | "lsm" | "audiodg" | "wermgr" | "unsecapp"
+            | "wmiprvse" | "securityhealthservice" | "textinputhost"
+            | "backgroundtransferhost" | "useroobebroker"
+    )
+}
+
+fn is_windows_dir(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.contains("\\windows\\system32\\")
+        || p.contains("\\windows\\syswow64\\")
+        || p.contains("\\windows\\systemapps\\")
 }

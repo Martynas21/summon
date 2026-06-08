@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ratatui::{
     DefaultTerminal, Frame,
-    crossterm::event::{self, Event, KeyCode, KeyModifiers},
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -23,7 +23,6 @@ enum Pane {
 #[derive(PartialEq)]
 enum Mode {
     Browse,
-    SelectApp,
     InputHotkey,
     ConfirmDelete,
     ConfirmQuit,
@@ -36,8 +35,15 @@ struct App {
     binding_state: ListState,
     app_state: ListState,
     mode: Mode,
+    // InputHotkey context
     hotkey_buf: String,
-    pending_app: Option<(String, String)>, // (ident, display_name) while adding
+    hotkey_is_new: bool,           // true = new binding, false = editing existing
+    hotkey_edit_idx: Option<usize>, // index being edited (when hotkey_is_new = false)
+    // New-binding flow: hotkey has been entered, waiting for app selection
+    pending_hotkey: Option<String>,
+    // Search
+    search_buf: String,
+    search_active: bool,
     status: Option<String>,
     dirty: bool,
 }
@@ -60,7 +66,11 @@ impl App {
             app_state,
             mode: Mode::Browse,
             hotkey_buf: String::new(),
-            pending_app: None,
+            hotkey_is_new: false,
+            hotkey_edit_idx: None,
+            pending_hotkey: None,
+            search_buf: String::new(),
+            search_active: false,
             status: None,
             dirty: false,
         }
@@ -69,14 +79,20 @@ impl App {
     fn navigate_up(&mut self) {
         match self.pane {
             Pane::Bindings => scroll_up(&mut self.binding_state, self.bindings.len()),
-            Pane::Apps => scroll_up(&mut self.app_state, self.running_apps.len()),
+            Pane::Apps => {
+                let len = filtered_apps(&self.running_apps, &self.search_buf).len();
+                scroll_up(&mut self.app_state, len);
+            }
         }
     }
 
     fn navigate_down(&mut self) {
         match self.pane {
             Pane::Bindings => scroll_down(&mut self.binding_state, self.bindings.len()),
-            Pane::Apps => scroll_down(&mut self.app_state, self.running_apps.len()),
+            Pane::Apps => {
+                let len = filtered_apps(&self.running_apps, &self.search_buf).len();
+                scroll_down(&mut self.app_state, len);
+            }
         }
     }
 }
@@ -95,6 +111,26 @@ fn scroll_down(state: &mut ListState, len: usize) {
     }
     let i = state.selected().unwrap_or(0);
     state.select(Some((i + 1) % len));
+}
+
+fn filtered_apps<'a>(apps: &'a [(String, String)], query: &str) -> Vec<&'a (String, String)> {
+    if query.is_empty() {
+        apps.iter().collect()
+    } else {
+        let q = query.to_lowercase();
+        apps.iter()
+            .filter(|(id, name)| name.to_lowercase().contains(&q) || id.to_lowercase().contains(&q))
+            .collect()
+    }
+}
+
+fn reset_app_selection(app: &mut App) {
+    let len = filtered_apps(&app.running_apps, &app.search_buf).len();
+    if len > 0 {
+        app.app_state.select(Some(0));
+    } else {
+        app.app_state.select(None);
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -138,10 +174,11 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         let Event::Key(key) = event::read()? else {
             continue;
         };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
 
-        if key.code == KeyCode::Char('c')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if app.dirty {
                 app.mode = Mode::ConfirmQuit;
                 continue;
@@ -155,7 +192,6 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                     return Ok(());
                 }
             }
-            Mode::SelectApp => handle_select_app(app, key.code),
             Mode::InputHotkey => handle_input_hotkey(app, key.code),
             Mode::ConfirmDelete => handle_confirm_delete(app, key.code),
             Mode::ConfirmQuit => {
@@ -168,38 +204,45 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 }
 
 fn handle_browse(app: &mut App, key: KeyCode) -> Result<bool> {
+    match app.pane {
+        Pane::Bindings => handle_browse_bindings(app, key),
+        Pane::Apps => handle_browse_apps(app, key),
+    }
+}
+
+fn handle_browse_bindings(app: &mut App, key: KeyCode) -> Result<bool> {
     match key {
         KeyCode::Up | KeyCode::Char('k') => app.navigate_up(),
         KeyCode::Down | KeyCode::Char('j') => app.navigate_down(),
         KeyCode::Tab => {
-            app.pane = match app.pane {
-                Pane::Bindings => Pane::Apps,
-                Pane::Apps => Pane::Bindings,
-            };
+            app.pane = Pane::Apps;
+            app.status = None;
         }
-        KeyCode::Char('n') => {
-            if app.running_apps.is_empty() {
-                app.status = Some("No running apps found — press 'r' to refresh.".into());
-            } else {
-                app.mode = Mode::SelectApp;
-                app.pane = Pane::Apps;
-                app.status = None;
+        // Edit hotkey of selected binding
+        KeyCode::Char('e') | KeyCode::Enter => {
+            if let Some(idx) = app.binding_state.selected() {
+                if let Some((hotkey, _)) = app.bindings.get(idx) {
+                    app.hotkey_buf = hotkey.clone();
+                    app.hotkey_is_new = false;
+                    app.hotkey_edit_idx = Some(idx);
+                    app.mode = Mode::InputHotkey;
+                    app.status = None;
+                }
             }
         }
+        KeyCode::Char('n') => {
+            app.hotkey_buf.clear();
+            app.hotkey_is_new = true;
+            app.hotkey_edit_idx = None;
+            app.mode = Mode::InputHotkey;
+            app.status = None;
+        }
         KeyCode::Char('d') => {
-            if app.pane == Pane::Bindings && !app.bindings.is_empty() {
+            if app.binding_state.selected().is_some() && !app.bindings.is_empty() {
                 app.mode = Mode::ConfirmDelete;
             }
         }
         KeyCode::Char('s') => save_config(app)?,
-        KeyCode::Char('r') => {
-            app.running_apps = list_platform_apps();
-            app.app_state = ListState::default();
-            if !app.running_apps.is_empty() {
-                app.app_state.select(Some(0));
-            }
-            app.status = Some(format!("Refreshed — {} apps", app.running_apps.len()));
-        }
         KeyCode::Char('q') | KeyCode::Esc => {
             if app.dirty {
                 app.mode = Mode::ConfirmQuit;
@@ -212,27 +255,102 @@ fn handle_browse(app: &mut App, key: KeyCode) -> Result<bool> {
     Ok(false)
 }
 
-fn handle_select_app(app: &mut App, key: KeyCode) {
+fn handle_browse_apps(app: &mut App, key: KeyCode) -> Result<bool> {
+    // Search input takes priority when active.
+    if app.search_active {
+        match key {
+            KeyCode::Esc => {
+                app.search_buf.clear();
+                app.search_active = false;
+                reset_app_selection(app);
+            }
+            KeyCode::Enter => {
+                app.search_active = false;
+            }
+            KeyCode::Backspace => {
+                app.search_buf.pop();
+                reset_app_selection(app);
+            }
+            KeyCode::Char(c) => {
+                app.search_buf.push(c);
+                reset_app_selection(app);
+            }
+            KeyCode::Up | KeyCode::Char('k') => app.navigate_up(),
+            KeyCode::Down | KeyCode::Char('j') => app.navigate_down(),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
     match key {
         KeyCode::Up | KeyCode::Char('k') => app.navigate_up(),
         KeyCode::Down | KeyCode::Char('j') => app.navigate_down(),
-        KeyCode::Enter => {
-            if let Some(idx) = app.app_state.selected() {
-                if let Some(entry) = app.running_apps.get(idx) {
-                    app.pending_app = Some(entry.clone());
-                    app.hotkey_buf.clear();
-                    app.mode = Mode::InputHotkey;
-                    app.status = None;
-                }
-            }
+        KeyCode::Char('/') => app.search_active = true,
+        // Assign selected app to the currently highlighted binding on the left.
+        KeyCode::Enter => assign_selected_app(app),
+        // Cancel: go back to bindings pane (remove placeholder if new-binding flow).
+        KeyCode::Tab | KeyCode::Esc => cancel_app_selection(app),
+        KeyCode::Char('r') => {
+            app.running_apps = list_platform_apps();
+            app.search_buf.clear();
+            app.search_active = false;
+            reset_app_selection(app);
+            app.status = Some(format!("Refreshed — {} apps", app.running_apps.len()));
         }
-        KeyCode::Esc => {
-            app.mode = Mode::Browse;
-            app.pane = Pane::Bindings;
-            app.status = None;
+        KeyCode::Char('s') => save_config(app)?,
+        KeyCode::Char('q') => {
+            if app.dirty {
+                app.mode = Mode::ConfirmQuit;
+            } else {
+                return Ok(true);
+            }
         }
         _ => {}
     }
+    Ok(false)
+}
+
+fn assign_selected_app(app: &mut App) {
+    let filtered = filtered_apps(&app.running_apps, &app.search_buf);
+    let Some(app_idx) = app.app_state.selected() else {
+        return;
+    };
+    let Some((ident, _name)) = filtered.get(app_idx) else {
+        return;
+    };
+    let ident = (*ident).clone();
+
+    // Which binding to update: the one highlighted on the left pane.
+    let Some(binding_idx) = app.binding_state.selected() else {
+        app.status = Some("No binding selected on the left — navigate there first.".into());
+        return;
+    };
+    if binding_idx >= app.bindings.len() {
+        return;
+    }
+
+    let hotkey = app.bindings[binding_idx].0.clone();
+    app.bindings[binding_idx].1 = ident.clone();
+    app.dirty = true;
+    app.pending_hotkey = None;
+    app.pane = Pane::Bindings;
+    app.status = Some(format!("Assigned {ident} → {hotkey}"));
+}
+
+fn cancel_app_selection(app: &mut App) {
+    // If a new binding was being created (hotkey entered, awaiting app), remove
+    // the placeholder so the user doesn't end up with a dangling "—" entry.
+    if let Some(hotkey) = app.pending_hotkey.take() {
+        app.bindings.retain(|(k, _)| k != &hotkey);
+        if app.bindings.is_empty() {
+            app.binding_state.select(None);
+        } else {
+            let sel = app.binding_state.selected().unwrap_or(0);
+            app.binding_state.select(Some(sel.min(app.bindings.len() - 1)));
+        }
+        app.status = Some("Cancelled new binding.".into());
+    }
+    app.pane = Pane::Bindings;
 }
 
 fn handle_input_hotkey(app: &mut App, key: KeyCode) {
@@ -248,7 +366,16 @@ fn handle_input_hotkey(app: &mut App, key: KeyCode) {
                     app.status = Some(format!("Invalid: {e}"));
                 }
                 Ok(new_spec) => {
-                    let duplicate = app.bindings.iter().any(|(k, _)| {
+                    // Duplicate check, skipping the binding being edited.
+                    let edit_idx = if app.hotkey_is_new {
+                        None
+                    } else {
+                        app.hotkey_edit_idx
+                    };
+                    let duplicate = app.bindings.iter().enumerate().any(|(i, (k, _))| {
+                        if Some(i) == edit_idx {
+                            return false;
+                        }
                         crate::config::parse_hotkey(k)
                             .map(|s| s.modifiers == new_spec.modifiers && s.key == new_spec.key)
                             .unwrap_or(false)
@@ -257,25 +384,39 @@ fn handle_input_hotkey(app: &mut App, key: KeyCode) {
                         app.status = Some(format!("'{buf}' is already bound"));
                         return;
                     }
-                    let (ident, _) = app.pending_app.take().unwrap();
-                    app.bindings.push((buf.clone(), ident.clone()));
-                    app.bindings.sort_by(|a, b| a.0.cmp(&b.0));
-                    if let Some(pos) = app.bindings.iter().position(|(k, _)| k == &buf) {
-                        app.binding_state.select(Some(pos));
+
+                    if app.hotkey_is_new {
+                        // Add a placeholder binding and switch to the apps pane.
+                        app.bindings.push((buf.clone(), String::from("—")));
+                        app.bindings.sort_by(|a, b| a.0.cmp(&b.0));
+                        if let Some(pos) = app.bindings.iter().position(|(k, _)| k == &buf) {
+                            app.binding_state.select(Some(pos));
+                        }
+                        app.pending_hotkey = Some(buf);
+                        app.pane = Pane::Apps;
+                        app.status = None;
+                    } else if let Some(idx) = app.hotkey_edit_idx {
+                        // Update the existing binding's hotkey in-place.
+                        if idx < app.bindings.len() {
+                            let old = app.bindings[idx].0.clone();
+                            app.bindings[idx].0 = buf.clone();
+                            app.bindings.sort_by(|a, b| a.0.cmp(&b.0));
+                            if let Some(pos) = app.bindings.iter().position(|(k, _)| k == &buf) {
+                                app.binding_state.select(Some(pos));
+                            }
+                            app.dirty = true;
+                            app.status = Some(format!("Hotkey updated: {old} → {buf}"));
+                        }
                     }
-                    app.dirty = true;
+
                     app.mode = Mode::Browse;
-                    app.pane = Pane::Bindings;
-                    app.status = Some(format!("Added {buf} → {ident}"));
                     app.hotkey_buf.clear();
                 }
             }
         }
         KeyCode::Esc => {
-            app.pending_app = None;
-            app.hotkey_buf.clear();
             app.mode = Mode::Browse;
-            app.pane = Pane::Bindings;
+            app.hotkey_buf.clear();
             app.status = None;
         }
         KeyCode::Backspace => {
@@ -332,7 +473,9 @@ fn save_config(app: &mut App) -> Result<()> {
         .unwrap_or_default();
     let mut bindings = HashMap::new();
     for (hotkey, ident) in &app.bindings {
-        bindings.insert(hotkey.clone(), BindingValue::Short(ident.clone()));
+        if ident != "—" {
+            bindings.insert(hotkey.clone(), BindingValue::Short(ident.clone()));
+        }
     }
     let cfg = Config {
         settings: existing.settings,
@@ -391,12 +534,18 @@ fn render_bindings(frame: &mut Frame, app: &mut App, area: Rect) {
         .bindings
         .iter()
         .map(|(hotkey, ident)| {
-            let truncated = if ident.len() > 28 {
+            let app_str = if ident.len() > 28 {
                 format!("{}…", &ident[..27])
             } else {
                 ident.clone()
             };
-            ListItem::new(format!("{hotkey:<14} {truncated}"))
+            // Dim placeholder entries that haven't been assigned an app yet.
+            let style = if ident == "—" {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            ListItem::new(format!("{hotkey:<14} {app_str}")).style(style)
         })
         .collect();
 
@@ -409,10 +558,10 @@ fn render_bindings(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_apps(frame: &mut Frame, app: &mut App, area: Rect) {
-    let in_select = app.mode == Mode::SelectApp;
-    let focused = in_select || (app.pane == Pane::Apps && app.mode == Mode::Browse);
+    let focused = app.pane == Pane::Apps && app.mode == Mode::Browse;
+    let has_pending = app.pending_hotkey.is_some();
 
-    let border_style = if in_select {
+    let border_style = if has_pending {
         Style::default().fg(Color::Yellow)
     } else if focused {
         Style::default().fg(Color::Cyan)
@@ -420,10 +569,21 @@ fn render_apps(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let title = if in_select {
-        format!(" Running Apps ({}) — Enter to pick ", app.running_apps.len())
+    let filtered = filtered_apps(&app.running_apps, &app.search_buf);
+    let count = filtered.len();
+    let total = app.running_apps.len();
+
+    let count_str = if app.search_buf.is_empty() {
+        format!("{total}")
     } else {
-        format!(" Running Apps ({}) ", app.running_apps.len())
+        format!("{count}/{total}")
+    };
+    let title = if app.search_active {
+        format!(" Apps ({count_str}) — /{}_  ", app.search_buf)
+    } else if !app.search_buf.is_empty() {
+        format!(" Apps ({count_str}) — /{} ", app.search_buf)
+    } else {
+        format!(" Running Apps ({count_str}) ")
     };
 
     let block = Block::default()
@@ -431,8 +591,7 @@ fn render_apps(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let items: Vec<ListItem> = app
-        .running_apps
+    let items: Vec<ListItem> = filtered
         .iter()
         .map(|(ident, name)| {
             let text = if ident == name {
@@ -476,11 +635,6 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Yellow),
         ),
         Mode::InputHotkey => {
-            let app_name = app
-                .pending_app
-                .as_ref()
-                .map(|(_, n)| n.as_str())
-                .unwrap_or("app");
             let valid = app.hotkey_buf.is_empty()
                 || crate::config::parse_hotkey(&app.hotkey_buf).is_ok();
             let indicator = if app.hotkey_buf.is_empty() {
@@ -490,11 +644,39 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 " ✗"
             };
+            let label = if app.hotkey_is_new {
+                "New binding hotkey"
+            } else {
+                "Edit hotkey"
+            };
             let color = if valid { Color::Green } else { Color::Red };
             (
-                format!(" Hotkey for '{app_name}': {}{indicator}", app.hotkey_buf),
+                format!(" {label}: {}{indicator}", app.hotkey_buf),
                 Style::default().fg(color),
             )
+        }
+        Mode::Browse if app.pane == Pane::Apps => {
+            // Show contextual guidance when in the apps pane.
+            if let Some(hotkey) = &app.pending_hotkey {
+                (
+                    format!(" New binding '{hotkey}' — pick an app, then press Enter"),
+                    Style::default().fg(Color::Yellow),
+                )
+            } else if let Some(idx) = app.binding_state.selected() {
+                if let Some((hotkey, current)) = app.bindings.get(idx) {
+                    (
+                        format!(" Enter assigns to '{hotkey}' (currently: {current})"),
+                        Style::default().fg(Color::Gray),
+                    )
+                } else {
+                    (String::new(), Style::default())
+                }
+            } else {
+                (
+                    " No binding selected — Tab to go back".into(),
+                    Style::default().fg(Color::DarkGray),
+                )
+            }
         }
         _ => (
             app.status
@@ -509,11 +691,23 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
-    let text = match app.mode {
-        Mode::SelectApp => " ↑↓/jk·navigate  Enter·pick  Esc·cancel",
-        Mode::InputHotkey => " Type hotkey string (e.g. ctrl+1, cmd+shift+f2)  Enter·confirm  Esc·cancel  Backspace·delete",
-        Mode::ConfirmDelete | Mode::ConfirmQuit => " y·confirm  any other key·cancel",
-        Mode::Browse => " ↑↓/jk·navigate  Tab·switch pane  n·add  d·delete  s·save  r·refresh  q·quit",
+    let text = if app.search_active {
+        " Type to filter  Enter·close search  Esc·clear & close  ↑↓/jk·navigate"
+    } else {
+        match (&app.mode, app.pane) {
+            (Mode::InputHotkey, _) => {
+                " Type hotkey (e.g. ctrl+1)  Enter·confirm  Esc·cancel  Backspace·delete"
+            }
+            (Mode::ConfirmDelete, _) | (Mode::ConfirmQuit, _) => {
+                " y·confirm  any other key·cancel"
+            }
+            (Mode::Browse, Pane::Bindings) => {
+                " ↑↓/jk·navigate  e/Enter·edit hotkey  n·new  d·delete  Tab·pick app  s·save  q·quit"
+            }
+            (Mode::Browse, Pane::Apps) => {
+                " ↑↓/jk·navigate  /·search  Enter·assign  Tab/Esc·back  r·refresh  s·save  q·quit"
+            }
+        }
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
