@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "summon", version, about = "macOS app/window summoner")]
+#[command(name = "summon", version, about = "App/window summoner — bind a hotkey to an app")]
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Cmd,
@@ -13,23 +13,23 @@ pub struct Cli {
 pub enum Cmd {
     /// Run the daemon in the foreground (logs to stderr).
     Run,
-    /// Install the LaunchAgent so the daemon auto-starts on login.
+    /// Install the autostart entry (LaunchAgent on macOS, Task Scheduler on Windows).
     Install,
-    /// Remove the LaunchAgent.
+    /// Remove the autostart entry.
     Uninstall,
-    /// Re-read the config file in the running daemon (sends SIGHUP).
+    /// Re-read the config file in the running daemon.
     Reload,
-    /// Stop the running daemon (sends SIGTERM).
+    /// Stop the running daemon.
     Stop,
-    /// Report daemon status, AX permission, and config validity.
+    /// Report daemon status and config validity.
     Status,
-    /// Parse-check a config file (defaults to ~/.config/summon/config.toml).
+    /// Parse-check a config file (defaults to the standard config path).
     Validate {
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
     },
-    /// Open the config file in $EDITOR (or $VISUAL, or TextEdit). Reloads
-    /// the daemon after the editor exits if the config still parses.
+    /// Open the config file in $EDITOR (or a platform default). Reloads the
+    /// daemon after the editor exits if the config still parses.
     Edit,
     /// Internal: launchd-spawned helper that fires the TCC modal under
     /// launchd attribution. Not for direct use.
@@ -40,15 +40,40 @@ pub enum Cmd {
 pub fn run(args: Cli) -> Result<()> {
     match args.cmd {
         Cmd::Run => crate::daemon::run(),
-        Cmd::Install => crate::launchd::install(),
-        Cmd::Uninstall => crate::launchd::uninstall(),
+        Cmd::Install => install(),
+        Cmd::Uninstall => uninstall(),
         Cmd::Reload => crate::ipc::reload(),
         Cmd::Stop => crate::ipc::stop(),
         Cmd::Status => status(),
         Cmd::Validate { path } => validate(path),
         Cmd::Edit => edit(),
-        Cmd::Grant => crate::launchd::grant(),
+        Cmd::Grant => grant(),
     }
+}
+
+fn install() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return crate::launchd::install();
+    #[cfg(target_os = "windows")]
+    return crate::windows::service::install();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    anyhow::bail!("install is not supported on this platform");
+}
+
+fn uninstall() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return crate::launchd::uninstall();
+    #[cfg(target_os = "windows")]
+    return crate::windows::service::uninstall();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    anyhow::bail!("uninstall is not supported on this platform");
+}
+
+fn grant() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return crate::launchd::grant();
+    #[cfg(not(target_os = "macos"))]
+    Ok(()) // no-op: no TCC equivalent on Windows/Linux
 }
 
 fn status() -> Result<()> {
@@ -65,9 +90,13 @@ fn status() -> Result<()> {
         "denied"
     };
     #[cfg(not(target_os = "macos"))]
-    let ax = "n/a (non-macos)";
+    let ax = "n/a";
 
-    println!("daemon:        {}", pid.map(|p| format!("running (pid {p})")).unwrap_or_else(|| "not running".into()));
+    println!(
+        "daemon:        {}",
+        pid.map(|p| format!("running (pid {p})"))
+            .unwrap_or_else(|| "not running".into())
+    );
     println!("ax permission: {ax}");
     println!("config:        {} ({})", cfg_path.display(), cfg_status);
     Ok(())
@@ -83,6 +112,34 @@ fn validate(path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+fn default_config() -> &'static str {
+    #[cfg(target_os = "windows")]
+    return r#"[settings]
+# cycle_reset_ms = 1500   # ms of inactivity before window cycle resets
+# hide_previous = false   # minimize previous app's window when switching
+# hold_threshold_ms = 0   # hold hotkey to minimize (0 = disabled)
+
+[bindings]
+# Use the exe stem (without .exe) as the app identifier.
+# "ctrl+1" = "firefox"
+# "ctrl+2" = "Code"
+# "ctrl+3" = "WindowsTerminal"
+# "ctrl+4" = "explorer"
+"#;
+    #[cfg(not(target_os = "windows"))]
+    return r#"[settings]
+# cycle_reset_ms = 1500   # ms of inactivity before window cycle resets
+# hide_previous = false   # minimize previous app's window when switching
+# hold_threshold_ms = 0   # hold hotkey to minimize (0 = disabled)
+
+[bindings]
+# Bundle ID (preferred) or display name as the app identifier.
+# "ctrl+1" = "com.mitchellh.ghostty"
+# "ctrl+2" = "Google Chrome"
+# "ctrl+3" = { app = "Finder", launch_args = ["--new"] }
+"#;
+}
+
 fn edit() -> Result<()> {
     use anyhow::{anyhow, Context};
     use std::process::Command;
@@ -93,7 +150,7 @@ fn edit() -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     if !path.exists() {
-        std::fs::write(&path, "[settings]\n\n[bindings]\n")
+        std::fs::write(&path, default_config())
             .with_context(|| format!("creating {}", path.display()))?;
     }
 
@@ -104,9 +161,6 @@ fn edit() -> Result<()> {
 
     let status = match editor {
         Some(cmd) => {
-            // Honour $EDITOR with args (e.g. "code --wait"). Splitting on
-            // whitespace mirrors what git and other tools do — good enough
-            // for the common cases, no shell-injection surface.
             let mut parts = cmd.split_whitespace();
             let prog = parts
                 .next()
@@ -117,12 +171,20 @@ fn edit() -> Result<()> {
                 .status()
                 .with_context(|| format!("spawning editor: {cmd}"))?
         }
+        #[cfg(target_os = "macos")]
         None => Command::new("/usr/bin/open")
             .arg("-t")
             .arg("-W")
             .arg(&path)
             .status()
             .context("spawning `open -t`")?,
+        #[cfg(target_os = "windows")]
+        None => Command::new("notepad")
+            .arg(&path)
+            .status()
+            .context("spawning notepad")?,
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        None => anyhow::bail!("no editor found; set $EDITOR"),
     };
     if !status.success() {
         return Err(anyhow!("editor exited with {status}"));

@@ -18,6 +18,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+if [[ "$(uname)" != "Darwin" ]]; then
+    echo "build.sh is macOS-only (codesign step). On Windows, use: cargo build --release" >&2
+    exit 1
+fi
+
 # Make sure the brew-installed rustup shims are on PATH (in case the script
 # runs from a launchd or other non-login context).
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"

@@ -86,11 +86,49 @@ pub fn run() -> Result<()> {
         // dispatches signal sources, runs blocks posted to the main queue.
         run_nsapp();
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext;
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (HANDLE)(-4)
+        unsafe { SetProcessDpiAwarenessContext((-4isize) as *mut std::ffi::c_void) };
+
+        crate::windows::dispatch::create_message_window()
+            .context("creating Windows message window")?;
+
+        let reload_event = create_win_event("Local\\summon-reload")?;
+        let stop_event = create_win_event("Local\\summon-stop")?;
+
+        let summoner = Summoner::new(&cfg);
+        let mut registry = HotkeyRegistry::new()?;
+        registry
+            .register_all(&cfg.bindings)
+            .context("registering hotkeys")?;
+
+        STATE
+            .set(Mutex::new(State {
+                summoner,
+                registry,
+                cfg_path,
+                pending_holds: std::collections::HashMap::new(),
+                reload_event,
+                stop_event,
+            }))
+            .ok()
+            .expect("STATE initialized twice");
+
+        spawn_ipc_watcher_thread(reload_event, stop_event);
+        spawn_hotkey_forwarder();
+
+        // Block on the Win32 message pump. Exits when WM_QUIT is posted
+        // (from on_shutdown or SetConsoleCtrlHandler).
+        crate::windows::dispatch::run_message_pump();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = cfg;
         let _ = cfg_path;
-        eprintln!("summon: only macOS is supported");
+        eprintln!("summon: only macOS and Windows are supported");
     }
 
     cleanup_pid_file();
@@ -318,4 +356,223 @@ extern "C" fn on_shutdown(_ctx: *mut std::ffi::c_void) {
     }
     cleanup_pid_file();
     std::process::exit(0);
+}
+
+// ── Windows implementation ────────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+struct State {
+    summoner: Summoner,
+    registry: HotkeyRegistry,
+    cfg_path: PathBuf,
+    pending_holds: std::collections::HashMap<u32, ()>,
+    reload_event: usize, // HANDLE stored as usize (Send-safe)
+    stop_event: usize,
+}
+
+// GlobalHotKeyManager on Windows contains a *mut c_void that lacks Send.
+// STATE is only mutated on the message-pump (main) thread; the IPC watcher
+// and hotkey forwarder only post messages and never touch STATE directly.
+#[cfg(target_os = "windows")]
+unsafe impl Send for State {}
+
+#[cfg(target_os = "windows")]
+static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+
+/// Called from dispatch.rs window proc when WM_SUMMON_RELOAD is received.
+#[cfg(target_os = "windows")]
+pub fn on_reload_main() {
+    info!("reload event received; reloading config");
+    let Some(state_lock) = STATE.get() else {
+        return;
+    };
+    let mut state = state_lock.lock().unwrap();
+    let cfg_path = state.cfg_path.clone();
+    match crate::config::load(&cfg_path) {
+        Ok(new_cfg) => {
+            state.registry.unregister_all();
+            if let Err(e) = state.registry.register_all(&new_cfg.bindings) {
+                error!("re-registering hotkeys after reload: {e:#}");
+            }
+            state.summoner.reconfigure(&new_cfg);
+            state.pending_holds.clear();
+            info!(bindings = new_cfg.bindings.len(), "reload complete");
+        }
+        Err(e) => error!("reload: failed to parse config: {e:#}"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateEventW(
+        lp_event_attributes: *const std::ffi::c_void,
+        b_manual_reset: i32,
+        b_initial_state: i32,
+        lp_name: *const u16,
+    ) -> *mut std::ffi::c_void;
+
+    fn WaitForMultipleObjects(
+        ncount: u32,
+        lphandles: *const *mut std::ffi::c_void,
+        bwaitall: i32,
+        dwmilliseconds: u32,
+    ) -> u32;
+}
+
+#[cfg(target_os = "windows")]
+fn create_win_event(name: &str) -> Result<usize> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
+    let handle = unsafe { CreateEventW(std::ptr::null(), 0, 0, wide.as_ptr()) };
+    if handle.is_null() {
+        anyhow::bail!("CreateEventW failed for {name}");
+    }
+    Ok(handle as usize)
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_ipc_watcher_thread(reload_event: usize, stop_event: usize) {
+    std::thread::Builder::new()
+        .name("summon-ipc-watcher".into())
+        .spawn(move || loop {
+            let handles: [*mut std::ffi::c_void; 2] = [
+                reload_event as *mut std::ffi::c_void,
+                stop_event as *mut std::ffi::c_void,
+            ];
+            // INFINITE = 0xFFFFFFFF, WAIT_OBJECT_0 = 0
+            let result = unsafe {
+                WaitForMultipleObjects(2, handles.as_ptr(), 0, 0xFFFF_FFFFu32)
+            };
+            if result == 0 {
+                crate::windows::dispatch::post_reload();
+            } else if result == 1 {
+                crate::windows::dispatch::post_shutdown();
+                break;
+            } else {
+                warn!("WaitForMultipleObjects returned {result:#x}; stopping IPC watcher");
+                break;
+            }
+        })
+        .expect("spawning IPC watcher thread");
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_hotkey_forwarder() {
+    use crate::windows::dispatch;
+    use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
+
+    std::thread::Builder::new()
+        .name("summon-hotkey-forwarder".into())
+        .spawn(|| {
+            let receiver = GlobalHotKeyEvent::receiver();
+            loop {
+                match receiver.recv() {
+                    Ok(event) => {
+                        let ctx = event.id as usize as *mut std::ffi::c_void;
+                        match event.state {
+                            HotKeyState::Pressed => unsafe {
+                                dispatch::async_to_main(ctx, on_hotkey_press_main)
+                            },
+                            HotKeyState::Released => unsafe {
+                                dispatch::async_to_main(ctx, on_hotkey_release_main)
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        error!("hotkey channel closed: {e}");
+                        return;
+                    }
+                }
+            }
+        })
+        .expect("spawning hotkey forwarder thread");
+}
+
+#[cfg(target_os = "windows")]
+extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
+    use crate::windows::dispatch;
+    let id = ctx as usize as u32;
+    let Some(state_lock) = STATE.get() else {
+        return;
+    };
+    let mut state = state_lock.lock().unwrap();
+    let Some((ident, filter)) = state
+        .registry
+        .target_for(id)
+        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
+    else {
+        warn!(id, "unmapped hotkey press");
+        return;
+    };
+    let threshold = state.summoner.hold_threshold();
+    match threshold {
+        None => {
+            info!(ident, id, "hotkey press (hold disabled)");
+            if let Err(e) = state.summoner.summon(&ident, filter.as_deref()) {
+                warn!(ident, "summon failed: {e:#}");
+            }
+        }
+        Some(d) => {
+            if state.pending_holds.contains_key(&id) {
+                return; // OS key-repeat; ignore
+            }
+            state.pending_holds.insert(id, ());
+            info!(ident, id, threshold_ms = d.as_millis() as u64, "hotkey press (pending)");
+            drop(state);
+            unsafe { dispatch::after_main_ms(d.as_millis() as u64, ctx, on_hold_fire) };
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
+    use crate::windows::dispatch;
+    let id = ctx as usize as u32;
+    let Some(state_lock) = STATE.get() else {
+        return;
+    };
+    let mut state = state_lock.lock().unwrap();
+    if state.pending_holds.remove(&id).is_none() {
+        return; // Timer already fired or hold disabled.
+    }
+    // Cancel the SetTimer so on_hold_fire never fires.
+    unsafe { dispatch::cancel_timer(ctx) };
+    let Some((ident, filter)) = state
+        .registry
+        .target_for(id)
+        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
+    else {
+        warn!(id, "unmapped hotkey release");
+        return;
+    };
+    info!(ident, id, "hotkey released → summon");
+    if let Err(e) = state.summoner.summon(&ident, filter.as_deref()) {
+        warn!(ident, "summon failed: {e:#}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+extern "C" fn on_hold_fire(ctx: *mut std::ffi::c_void) {
+    let id = ctx as usize as u32;
+    let Some(state_lock) = STATE.get() else {
+        return;
+    };
+    let mut state = state_lock.lock().unwrap();
+    if state.pending_holds.remove(&id).is_none() {
+        return; // Released before threshold fired (cancel_timer beat us).
+    }
+    let Some((ident, filter)) = state
+        .registry
+        .target_for(id)
+        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
+    else {
+        warn!(id, "hold fired for unmapped id");
+        return;
+    };
+    info!(ident, id, "hold threshold elapsed → minimize");
+    if let Err(e) = state.summoner.minimize_frontmost(&ident, filter.as_deref()) {
+        warn!(ident, "minimize_frontmost failed: {e:#}");
+    }
 }
