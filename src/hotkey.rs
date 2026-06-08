@@ -114,3 +114,81 @@ fn to_code(key: &str) -> Option<Code> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Modifiers as SpecMods;
+    use global_hotkey::hotkey::{Code, Modifiers as GhMods};
+
+    // --- to_gh_mods ---
+
+    #[test]
+    fn no_modifiers_gives_empty_flags() {
+        let mods = to_gh_mods(SpecMods::default());
+        assert_eq!(mods, GhMods::empty());
+    }
+
+    #[test]
+    fn ctrl_maps_to_control() {
+        let mods = to_gh_mods(SpecMods { ctrl: true, ..Default::default() });
+        assert!(mods.contains(GhMods::CONTROL));
+        assert!(!mods.contains(GhMods::ALT));
+        assert!(!mods.contains(GhMods::SHIFT));
+        assert!(!mods.contains(GhMods::META));
+    }
+
+    #[test]
+    fn all_four_modifiers_combine() {
+        let mods = to_gh_mods(SpecMods { ctrl: true, alt: true, shift: true, cmd: true });
+        assert_eq!(mods, GhMods::CONTROL | GhMods::ALT | GhMods::SHIFT | GhMods::META);
+    }
+
+    // --- to_code ---
+
+    #[test]
+    fn digit_keys_map() {
+        assert_eq!(to_code("0"), Some(Code::Digit0));
+        assert_eq!(to_code("9"), Some(Code::Digit9));
+    }
+
+    #[test]
+    fn letter_keys_map() {
+        assert_eq!(to_code("a"), Some(Code::KeyA));
+        assert_eq!(to_code("z"), Some(Code::KeyZ));
+    }
+
+    #[test]
+    fn function_keys_map() {
+        assert_eq!(to_code("f1"), Some(Code::F1));
+        assert_eq!(to_code("f20"), Some(Code::F20));
+    }
+
+    #[test]
+    fn special_keys_map() {
+        assert_eq!(to_code("space"), Some(Code::Space));
+        assert_eq!(to_code("tab"), Some(Code::Tab));
+        assert_eq!(to_code("backspace"), Some(Code::Backspace));
+        assert_eq!(to_code("left"), Some(Code::ArrowLeft));
+        assert_eq!(to_code("pageup"), Some(Code::PageUp));
+    }
+
+    #[test]
+    fn enter_and_return_are_aliases() {
+        assert_eq!(to_code("enter"), Some(Code::Enter));
+        assert_eq!(to_code("return"), Some(Code::Enter));
+    }
+
+    #[test]
+    fn esc_is_alias_for_escape() {
+        assert_eq!(to_code("escape"), Some(Code::Escape));
+        assert_eq!(to_code("esc"), Some(Code::Escape));
+    }
+
+    #[test]
+    fn unknown_key_returns_none() {
+        assert_eq!(to_code("nope"), None);
+        assert_eq!(to_code(""), None);
+        assert_eq!(to_code("F1"), None); // case-sensitive — config normalises to lowercase
+    }
+}

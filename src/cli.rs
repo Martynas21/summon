@@ -31,6 +31,8 @@ pub enum Cmd {
     /// Open the config file in $EDITOR (or a platform default). Reloads the
     /// daemon after the editor exits if the config still parses.
     Edit,
+    /// Manage hotkey bindings via interactive TUI.
+    Manage,
     /// Internal: launchd-spawned helper that fires the TCC modal under
     /// launchd attribution. Not for direct use.
     #[command(name = "_grant", hide = true)]
@@ -47,6 +49,7 @@ pub fn run(args: Cli) -> Result<()> {
         Cmd::Status => status(),
         Cmd::Validate { path } => validate(path),
         Cmd::Edit => edit(),
+        Cmd::Manage => crate::tui::run(),
         Cmd::Grant => grant(),
     }
 }

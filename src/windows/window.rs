@@ -3,7 +3,7 @@ use windows_sys::Win32::Foundation::{BOOL, FALSE, LPARAM, TRUE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindow, GetWindowTextLengthW,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    SetForegroundWindow, ShowWindow, GW_OWNER, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
+    SetForegroundWindow, ShowWindow, GW_OWNER, SW_FORCEMINIMIZE, SW_RESTORE, SW_SHOW,
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
@@ -78,7 +78,7 @@ pub fn is_minimized(win: &WindowHandle) -> bool {
 }
 
 pub fn minimize(win: &WindowHandle) {
-    unsafe { ShowWindow(win.0, SW_MINIMIZE) };
+    unsafe { ShowWindow(win.0, SW_FORCEMINIMIZE) };
 }
 
 pub fn unminimize(win: &WindowHandle) {

@@ -604,6 +604,13 @@ fn derive_hold_threshold(configured_ms: u64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ParsedConfig, Settings};
+
+    fn cfg_with(settings: Settings) -> ParsedConfig {
+        ParsedConfig { settings, bindings: vec![] }
+    }
+
+    // --- derive_hold_threshold ---
 
     #[test]
     fn hold_threshold_zero_is_disabled() {
@@ -613,5 +620,72 @@ mod tests {
     #[test]
     fn hold_threshold_positive_enables() {
         assert_eq!(derive_hold_threshold(200), Some(Duration::from_millis(200)));
+    }
+
+    // --- derive_cycle_window ---
+
+    #[test]
+    fn cycle_window_zero_uses_default() {
+        assert_eq!(derive_cycle_window(0), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn cycle_window_positive_overrides_default() {
+        assert_eq!(derive_cycle_window(300), Duration::from_millis(300));
+    }
+
+    // --- cursor_key ---
+
+    #[test]
+    fn cursor_key_prefers_bundle_id_over_name() {
+        assert_eq!(cursor_key("com.apple.Safari", "Safari"), "com.apple.Safari");
+    }
+
+    #[test]
+    fn cursor_key_falls_back_to_name_when_bundle_id_empty() {
+        assert_eq!(cursor_key("", "Firefox"), "Firefox");
+    }
+
+    #[test]
+    fn cursor_key_both_empty_gives_empty_string() {
+        assert_eq!(cursor_key("", ""), "");
+    }
+
+    // --- Summoner::new ---
+
+    #[test]
+    fn new_reads_hide_previous_from_config() {
+        let s = Summoner::new(&cfg_with(Settings { hide_previous: true, ..Default::default() }));
+        assert!(s.hide_previous);
+    }
+
+    #[test]
+    fn new_hold_threshold_enabled_by_default() {
+        let s = Summoner::new(&cfg_with(Settings::default()));
+        assert_eq!(s.hold_threshold(), Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn new_reads_hold_threshold_from_config() {
+        let s = Summoner::new(&cfg_with(Settings { hold_threshold_ms: 250, ..Default::default() }));
+        assert_eq!(s.hold_threshold(), Some(Duration::from_millis(250)));
+    }
+
+    // --- Summoner::reconfigure ---
+
+    #[test]
+    fn reconfigure_updates_hold_threshold() {
+        let mut s = Summoner::new(&cfg_with(Settings::default()));
+        assert_eq!(s.hold_threshold(), Some(Duration::from_millis(200)));
+        s.reconfigure(&cfg_with(Settings { hold_threshold_ms: 100, ..Default::default() }));
+        assert_eq!(s.hold_threshold(), Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn reconfigure_updates_hide_previous() {
+        let mut s = Summoner::new(&cfg_with(Settings { hide_previous: false, ..Default::default() }));
+        assert!(!s.hide_previous);
+        s.reconfigure(&cfg_with(Settings { hide_previous: true, ..Default::default() }));
+        assert!(s.hide_previous);
     }
 }

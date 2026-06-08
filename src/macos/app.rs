@@ -203,3 +203,32 @@ pub fn bundle_id(app: &NSRunningApplication) -> Option<String> {
 pub fn name(app: &NSRunningApplication) -> Option<String> {
     unsafe { app.localizedName() }.map(|ns| ns.to_string())
 }
+
+/// Returns (identifier, display_name) for all running apps that have a
+/// localized name — a reliable proxy for user-visible apps without needing
+/// the NSApplicationActivationPolicy type. Sorted by display name,
+/// deduplicated by identifier.
+pub fn list_running_apps() -> Vec<(String, String)> {
+    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
+    let apps = unsafe { workspace.runningApplications() };
+    let n = apps.count();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..n {
+        let app: Retained<NSRunningApplication> = unsafe { apps.objectAtIndex(i) };
+        let Some(display) = unsafe { app.localizedName() }.map(|ns| ns.to_string()) else {
+            continue;
+        };
+        if display.is_empty() {
+            continue;
+        }
+        let ident = unsafe { app.bundleIdentifier() }
+            .map(|ns| ns.to_string())
+            .unwrap_or_else(|| display.clone());
+        if seen.insert(ident.clone()) {
+            out.push((ident, display));
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
+}

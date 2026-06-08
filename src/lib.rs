@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod tui;
 pub mod cycle_state;
 pub mod daemon;
 pub mod hotkey;

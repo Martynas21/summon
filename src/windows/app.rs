@@ -187,3 +187,17 @@ fn exe_stem(path: &str) -> String {
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_else(|| path.to_lowercase())
 }
+
+/// Returns (identifier, display_name) for all processes with visible windows.
+/// On Windows, identifier and display_name are both the lowercase exe stem.
+pub fn list_running_apps() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    enumerate_pids(|_pid, path| {
+        let stem = exe_stem(&path);
+        out.push((stem.clone(), stem));
+        true
+    });
+    out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
+}
