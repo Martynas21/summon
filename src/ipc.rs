@@ -169,7 +169,10 @@ fn open_named_event(name: &str) -> Result<*mut std::ffi::c_void> {
 fn set_and_close_event(handle: *mut std::ffi::c_void) -> Result<()> {
     use windows_sys::Win32::Foundation::CloseHandle;
     unsafe {
-        SetEvent(handle);
+        if SetEvent(handle) == 0 {
+            CloseHandle(handle);
+            anyhow::bail!("SetEvent failed");
+        }
         CloseHandle(handle);
     }
     Ok(())

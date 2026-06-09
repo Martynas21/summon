@@ -38,9 +38,10 @@ impl HotkeyRegistry {
                 .ok_or_else(|| anyhow!("unsupported key '{}' in '{}'", b.hotkey.key, b.hotkey.raw))?;
             let hk = HotKey::new(Some(mods), code);
             let id = hk.id();
-            self.manager
-                .register(hk)
-                .map_err(|e| anyhow!("register '{}': {e:?}", b.hotkey.raw))?;
+            if let Err(e) = self.manager.register(hk) {
+                self.unregister_all();
+                return Err(anyhow!("register '{}': {e:?}", b.hotkey.raw));
+            }
             self.id_to_target.insert(
                 id,
                 BindingTarget {
