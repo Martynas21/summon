@@ -156,8 +156,9 @@ fn for_each_process(mut cb: impl FnMut(u32, &str) -> bool) {
     };
     const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
 
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = (-1isize) as *mut std::ffi::c_void;
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot.is_null() {
+    if snapshot == INVALID_HANDLE_VALUE {
         return;
     }
 

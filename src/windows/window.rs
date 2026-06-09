@@ -107,7 +107,9 @@ pub fn raise(win: &WindowHandle) {
         let mut target_tid = 0u32;
         let mut fg_tid = 0u32;
         GetWindowThreadProcessId(win.0, &mut target_tid);
-        GetWindowThreadProcessId(fg, &mut fg_tid);
+        if !fg.is_null() {
+            GetWindowThreadProcessId(fg, &mut fg_tid);
+        }
 
         let attach_fg = fg_tid != 0 && fg_tid != current_tid && fg_tid != target_tid;
         // Also attach to the target thread so Electron apps (Discord, VS Code)

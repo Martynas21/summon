@@ -64,7 +64,8 @@ pub unsafe fn after_main_ms(ms: u64, ctx: *mut c_void, work: extern "C" fn(*mut 
             map.insert(timer_id, (ctx as usize, work));
         }
     }
-    unsafe { SetTimer(hwnd, timer_id, ms as u32, None) };
+    let ms_u32 = u32::try_from(ms).unwrap_or(u32::MAX);
+    unsafe { SetTimer(hwnd, timer_id, ms_u32, None) };
 }
 
 pub unsafe fn cancel_timer(ctx: *mut c_void) {
@@ -82,7 +83,7 @@ pub fn post_reload() {
 }
 
 pub fn post_shutdown() {
-    unsafe { PostQuitMessage(0) };
+    unsafe { PostMessageW(msg_hwnd(), WM_SUMMON_STOP, 0, 0) };
 }
 
 fn msg_hwnd() -> HWND {
