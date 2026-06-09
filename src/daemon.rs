@@ -121,7 +121,7 @@ pub fn run() -> Result<()> {
         spawn_hotkey_forwarder();
 
         // Block on the Win32 message pump. Exits when WM_QUIT is posted
-        // (from on_shutdown or SetConsoleCtrlHandler).
+        // (from msg_wnd_proc's WM_SUMMON_STOP handler, triggered by post_shutdown).
         crate::windows::dispatch::run_message_pump();
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -223,7 +223,10 @@ extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
     let Some(state_lock) = STATE.get() else {
         return;
     };
-    let mut state = state_lock.lock().unwrap();
+    let mut state = match state_lock.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     let Some((ident, filter)) = state
         .registry
         .target_for(id)
@@ -260,7 +263,10 @@ extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
     let Some(state_lock) = STATE.get() else {
         return;
     };
-    let mut state = state_lock.lock().unwrap();
+    let mut state = match state_lock.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     if state.pending_holds.remove(&id).is_none() {
         // Timer already fired (or hold disabled — release wasn't tracked).
         return;
@@ -285,7 +291,10 @@ extern "C" fn on_hold_fire(ctx: *mut std::ffi::c_void) {
     let Some(state_lock) = STATE.get() else {
         return;
     };
-    let mut state = state_lock.lock().unwrap();
+    let mut state = match state_lock.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     if state.pending_holds.remove(&id).is_none() {
         // Released before threshold (handled by release path) — or reload
         // cleared the map. Either way, no-op.
@@ -328,7 +337,10 @@ extern "C" fn on_sighup(_ctx: *mut std::ffi::c_void) {
     let Some(state_lock) = STATE.get() else {
         return;
     };
-    let mut state = state_lock.lock().unwrap();
+    let mut state = match state_lock.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     let cfg_path = state.cfg_path.clone();
     match crate::config::load(&cfg_path) {
         Ok(new_cfg) => {
@@ -352,7 +364,11 @@ extern "C" fn on_sighup(_ctx: *mut std::ffi::c_void) {
 extern "C" fn on_shutdown(_ctx: *mut std::ffi::c_void) {
     info!("SIGTERM/SIGINT received; shutting down");
     if let Some(state_lock) = STATE.get() {
-        state_lock.lock().unwrap().registry.unregister_all();
+        let mut state = match state_lock.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        state.registry.unregister_all();
     }
     cleanup_pid_file();
     std::process::exit(0);
@@ -377,6 +393,21 @@ struct State {
 unsafe impl Send for State {}
 
 #[cfg(target_os = "windows")]
+impl Drop for State {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        unsafe {
+            if self.reload_event != 0 {
+                CloseHandle(self.reload_event as *mut std::ffi::c_void);
+            }
+            if self.stop_event != 0 {
+                CloseHandle(self.stop_event as *mut std::ffi::c_void);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
 /// Called from dispatch.rs window proc when WM_SUMMON_RELOAD is received.
@@ -386,7 +417,10 @@ pub fn on_reload_main() {
     let Some(state_lock) = STATE.get() else {
         return;
     };
-    let mut state = state_lock.lock().unwrap();
+    let mut state = match state_lock.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     let cfg_path = state.cfg_path.clone();
     match crate::config::load(&cfg_path) {
         Ok(new_cfg) => {
@@ -497,7 +531,10 @@ extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
     let Some(state_lock) = STATE.get() else {
         return;
     };
-    let mut state = state_lock.lock().unwrap();
+    let mut state = match state_lock.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     let Some((ident, filter)) = state
         .registry
         .target_for(id)
@@ -533,7 +570,10 @@ extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
     let Some(state_lock) = STATE.get() else {
         return;
     };
-    let mut state = state_lock.lock().unwrap();
+    let mut state = match state_lock.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     if state.pending_holds.remove(&id).is_none() {
         return; // Timer already fired or hold disabled.
     }
@@ -559,7 +599,10 @@ extern "C" fn on_hold_fire(ctx: *mut std::ffi::c_void) {
     let Some(state_lock) = STATE.get() else {
         return;
     };
-    let mut state = state_lock.lock().unwrap();
+    let mut state = match state_lock.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     if state.pending_holds.remove(&id).is_none() {
         return; // Released before threshold fired (cancel_timer beat us).
     }
