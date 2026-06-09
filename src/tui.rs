@@ -507,6 +507,7 @@ fn render_bindings(frame: &mut Frame, app: &mut App, area: Rect) {
         .bindings
         .iter()
         .map(|(hotkey, ident)| {
+            // chars(), not display columns; fine for the ASCII-dominant app-name corpus
             let app_str = if ident.chars().count() > 28 {
                 format!("{}…", ident.chars().take(27).collect::<String>())
             } else {
@@ -570,6 +571,7 @@ fn render_apps(frame: &mut Frame, app: &mut App, area: Rect) {
             let text = if ident == name {
                 name.clone()
             } else {
+                // chars(), not display columns; fine for the ASCII-dominant app-name corpus
                 let short = if ident.chars().count() > 32 {
                     format!("{}…", ident.chars().take(31).collect::<String>())
                 } else {
