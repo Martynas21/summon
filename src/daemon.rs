@@ -225,7 +225,7 @@ extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
     };
     let mut state = match state_lock.lock() {
         Ok(g) => g,
-        Err(e) => e.into_inner(),
+        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
     };
     let Some((ident, filter)) = state
         .registry
@@ -265,7 +265,7 @@ extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
     };
     let mut state = match state_lock.lock() {
         Ok(g) => g,
-        Err(e) => e.into_inner(),
+        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
     };
     if state.pending_holds.remove(&id).is_none() {
         // Timer already fired (or hold disabled — release wasn't tracked).
@@ -293,7 +293,7 @@ extern "C" fn on_hold_fire(ctx: *mut std::ffi::c_void) {
     };
     let mut state = match state_lock.lock() {
         Ok(g) => g,
-        Err(e) => e.into_inner(),
+        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
     };
     if state.pending_holds.remove(&id).is_none() {
         // Released before threshold (handled by release path) — or reload
@@ -339,7 +339,7 @@ extern "C" fn on_sighup(_ctx: *mut std::ffi::c_void) {
     };
     let mut state = match state_lock.lock() {
         Ok(g) => g,
-        Err(e) => e.into_inner(),
+        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
     };
     let cfg_path = state.cfg_path.clone();
     match crate::config::load(&cfg_path) {
@@ -366,7 +366,7 @@ extern "C" fn on_shutdown(_ctx: *mut std::ffi::c_void) {
     if let Some(state_lock) = STATE.get() {
         let mut state = match state_lock.lock() {
             Ok(g) => g,
-            Err(e) => e.into_inner(),
+            Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
         };
         state.registry.unregister_all();
     }
@@ -392,6 +392,9 @@ struct State {
 #[cfg(target_os = "windows")]
 unsafe impl Send for State {}
 
+// NOTE: OnceLock statics are not dropped on std::process::exit, so this Drop
+// impl only fires if State is ever stack/heap allocated (e.g. in tests). The
+// OS reclaims the handles on process exit regardless.
 #[cfg(target_os = "windows")]
 impl Drop for State {
     fn drop(&mut self) {
@@ -419,7 +422,7 @@ pub fn on_reload_main() {
     };
     let mut state = match state_lock.lock() {
         Ok(g) => g,
-        Err(e) => e.into_inner(),
+        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
     };
     let cfg_path = state.cfg_path.clone();
     match crate::config::load(&cfg_path) {
@@ -533,7 +536,7 @@ extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
     };
     let mut state = match state_lock.lock() {
         Ok(g) => g,
-        Err(e) => e.into_inner(),
+        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
     };
     let Some((ident, filter)) = state
         .registry
@@ -572,7 +575,7 @@ extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
     };
     let mut state = match state_lock.lock() {
         Ok(g) => g,
-        Err(e) => e.into_inner(),
+        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
     };
     if state.pending_holds.remove(&id).is_none() {
         return; // Timer already fired or hold disabled.
@@ -601,7 +604,7 @@ extern "C" fn on_hold_fire(ctx: *mut std::ffi::c_void) {
     };
     let mut state = match state_lock.lock() {
         Ok(g) => g,
-        Err(e) => e.into_inner(),
+        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
     };
     if state.pending_holds.remove(&id).is_none() {
         return; // Released before threshold fired (cancel_timer beat us).
