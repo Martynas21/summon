@@ -341,6 +341,14 @@ impl Summoner {
         app::ensure_visible(&running);
 
         let wins = window::windows_for_pid(pid);
+        // Fallback for apps that hide to the system tray via SW_HIDE (e.g.
+        // Discord). Their main window is invisible but still enumerable; raise
+        // calls SW_SHOW so it restores correctly.
+        let wins = if wins.is_empty() {
+            window::tray_windows_for_pid(pid)
+        } else {
+            wins
+        };
         if wins.is_empty() {
             warn!(ident, "no enumerable windows; activate only");
             app::activate(&running);

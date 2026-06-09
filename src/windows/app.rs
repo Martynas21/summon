@@ -2,12 +2,12 @@ use anyhow::{Context, Result};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, LPARAM, TRUE};
+use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowThreadProcessId,
+    GetForegroundWindow, GetWindowThreadProcessId,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
@@ -35,11 +35,10 @@ pub struct RunningApp {
 
 pub fn find_running_filtered(ident: &str, cmdline_filter: Option<&str>) -> Option<RunningApp> {
     let ident_lower = ident.to_lowercase();
-    let mut found: Option<RunningApp> = None;
+    let mut candidates: Vec<RunningApp> = Vec::new();
 
-    enumerate_pids(|pid, exe_path| {
-        let stem = exe_stem(&exe_path);
-        if stem != ident_lower && exe_path != ident_lower {
+    for_each_process(|pid, stem| {
+        if stem != ident_lower {
             return true;
         }
         if let Some(filter) = cmdline_filter {
@@ -47,11 +46,23 @@ pub fn find_running_filtered(ident: &str, cmdline_filter: Option<&str>) -> Optio
                 return true;
             }
         }
-        found = Some(RunningApp { pid, exe_name: stem });
-        false
+        candidates.push(RunningApp { pid, exe_name: stem.to_string() });
+        true
     });
 
-    found
+    if candidates.len() <= 1 {
+        return candidates.into_iter().next();
+    }
+    // Electron apps (VS Code, Slack, …) spawn many helper processes sharing
+    // the same exe name. The main process may not own any HWNDs — renderer
+    // processes do. Prefer a candidate that owns enumerable windows.
+    if let Some(app) = candidates
+        .iter()
+        .find(|a| !super::window::tray_windows_for_pid(a.pid).is_empty())
+    {
+        return Some(app.clone());
+    }
+    candidates.into_iter().next()
 }
 
 pub fn launch(ident: &str) -> Result<()> {
@@ -135,33 +146,43 @@ pub fn frontmost_pid() -> Option<u32> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn enumerate_pids(mut cb: impl FnMut(u32, String) -> bool) {
-    let mut pids: Vec<u32> = Vec::new();
-    unsafe {
-        EnumWindows(Some(collect_pids_cb), &mut pids as *mut Vec<u32> as LPARAM);
-    }
-    pids.sort_unstable();
-    pids.dedup();
+/// Enumerate all processes using CreateToolhelp32Snapshot. Calls `cb(pid,
+/// exe_stem)` for every process; return `false` from the callback to stop early.
+/// This covers apps (e.g. Ghostty) that don't own a traditional top-level HWND
+/// and would be missed by an EnumWindows-based scan.
+fn for_each_process(mut cb: impl FnMut(u32, &str) -> bool) {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+    };
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
 
-    for pid in pids {
-        if let Some(path) = exe_path_for_pid(pid) {
-            if !cb(pid, path) {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() {
+        return;
+    }
+
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    if unsafe { Process32FirstW(snapshot, &mut entry) } != FALSE {
+        loop {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let raw = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            let stem = exe_stem(&raw);
+            if !stem.is_empty() && !cb(entry.th32ProcessID, &stem) {
+                break;
+            }
+            if unsafe { Process32NextW(snapshot, &mut entry) } == FALSE {
                 break;
             }
         }
     }
-}
 
-extern "system" fn collect_pids_cb(hwnd: *mut c_void, lparam: LPARAM) -> i32 {
-    unsafe {
-        let list = &mut *(lparam as *mut Vec<u32>);
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if pid != 0 {
-            list.push(pid);
-        }
-    }
-    TRUE
+    unsafe { CloseHandle(snapshot) };
 }
 
 fn exe_path_for_pid(pid: u32) -> Option<String> {
@@ -189,51 +210,26 @@ fn exe_stem(path: &str) -> String {
 }
 
 /// Returns (identifier, display_name) for all user-facing processes.
-/// Uses CreateToolhelp32Snapshot so apps that don't own a traditional top-level
-/// HWND (e.g. Ghostty, packaged apps) are still included.
 pub fn list_running_apps() -> Vec<(String, String)> {
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-    };
-    // TH32CS_SNAPPROCESS = 0x2 — snapshot of all processes in the system.
-    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
-
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot.is_null() {
-        return Vec::new();
-    }
-
-    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
     let mut out: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::<String>::new();
 
-    if unsafe { Process32FirstW(snapshot, &mut entry) } != FALSE {
-        loop {
-            let len = entry
-                .szExeFile
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(entry.szExeFile.len());
-            let raw = String::from_utf16_lossy(&entry.szExeFile[..len]);
-            let stem = exe_stem(&raw.to_lowercase());
-
-            if !stem.is_empty() && !is_system_stem(&stem) {
-                if let Some(path) = exe_path_for_pid(entry.th32ProcessID) {
-                    if !is_windows_dir(&path) && seen.insert(stem.clone()) {
-                        out.push((stem.clone(), stem));
-                    }
-                }
-            }
-
-            if unsafe { Process32NextW(snapshot, &mut entry) } == FALSE {
-                break;
-            }
+    for_each_process(|pid, stem| {
+        if is_system_stem(stem) {
+            return true;
         }
-    }
+        // Filter system dirs when we can get the full path; if we can't,
+        // include the app anyway (it passed the stem filter).
+        let include = match exe_path_for_pid(pid) {
+            Some(path) => !is_windows_dir(&path),
+            None => true,
+        };
+        if include && seen.insert(stem.to_string()) {
+            out.push((stem.to_string(), stem.to_string()));
+        }
+        true
+    });
 
-    unsafe { CloseHandle(snapshot) };
     out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     out
 }

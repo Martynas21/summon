@@ -25,7 +25,6 @@ enum Mode {
     Browse,
     InputHotkey,
     ConfirmDelete,
-    ConfirmQuit,
 }
 
 struct App {
@@ -179,10 +178,6 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
 
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if app.dirty {
-                app.mode = Mode::ConfirmQuit;
-                continue;
-            }
             return Ok(());
         }
 
@@ -194,11 +189,6 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             }
             Mode::InputHotkey => handle_input_hotkey(app, key.code),
             Mode::ConfirmDelete => handle_confirm_delete(app, key.code),
-            Mode::ConfirmQuit => {
-                if handle_confirm_quit(app, key.code) {
-                    return Ok(());
-                }
-            }
         }
     }
 }
@@ -242,14 +232,11 @@ fn handle_browse_bindings(app: &mut App, key: KeyCode) -> Result<bool> {
                 app.mode = Mode::ConfirmDelete;
             }
         }
-        KeyCode::Char('s') => save_config(app)?,
-        KeyCode::Char('q') | KeyCode::Esc => {
-            if app.dirty {
-                app.mode = Mode::ConfirmQuit;
-            } else {
-                return Ok(true);
-            }
+        KeyCode::Char('q') => {
+            save_config(app)?;
+            return Ok(true);
         }
+        KeyCode::Esc => return Ok(true),
         _ => {}
     }
     Ok(false)
@@ -297,13 +284,9 @@ fn handle_browse_apps(app: &mut App, key: KeyCode) -> Result<bool> {
             reset_app_selection(app);
             app.status = Some(format!("Refreshed — {} apps", app.running_apps.len()));
         }
-        KeyCode::Char('s') => save_config(app)?,
         KeyCode::Char('q') => {
-            if app.dirty {
-                app.mode = Mode::ConfirmQuit;
-            } else {
-                return Ok(true);
-            }
+            save_config(app)?;
+            return Ok(true);
         }
         _ => {}
     }
@@ -455,16 +438,6 @@ fn handle_confirm_delete(app: &mut App, key: KeyCode) {
     }
 }
 
-fn handle_confirm_quit(app: &mut App, key: KeyCode) -> bool {
-    match key {
-        KeyCode::Char('y') | KeyCode::Char('Y') => true,
-        _ => {
-            app.mode = Mode::Browse;
-            false
-        }
-    }
-}
-
 fn save_config(app: &mut App) -> Result<()> {
     let path = paths::config_file()?;
     let existing: Config = fs::read_to_string(&path)
@@ -484,12 +457,8 @@ fn save_config(app: &mut App) -> Result<()> {
     let toml_str = toml::to_string_pretty(&cfg)?;
     fs::write(&path, toml_str)?;
     app.dirty = false;
-    if ipc::running_pid().is_ok() {
-        ipc::reload()?;
-        app.status = Some("Saved and reloaded.".into());
-    } else {
-        app.status = Some("Saved.".into());
-    }
+    let reloaded = ipc::reload_quiet()?;
+    app.status = Some(if reloaded { "Saved and reloaded.".into() } else { "Saved.".into() });
     Ok(())
 }
 
@@ -630,10 +599,6 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             };
             (msg, Style::default().fg(Color::Yellow))
         }
-        Mode::ConfirmQuit => (
-            " Unsaved changes — quit without saving? [y/N]".into(),
-            Style::default().fg(Color::Yellow),
-        ),
         Mode::InputHotkey => {
             let valid = app.hotkey_buf.is_empty()
                 || crate::config::parse_hotkey(&app.hotkey_buf).is_ok();
@@ -698,14 +663,14 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
             (Mode::InputHotkey, _) => {
                 " Type hotkey (e.g. ctrl+1)  Enter·confirm  Esc·cancel  Backspace·delete"
             }
-            (Mode::ConfirmDelete, _) | (Mode::ConfirmQuit, _) => {
+            (Mode::ConfirmDelete, _) => {
                 " y·confirm  any other key·cancel"
             }
             (Mode::Browse, Pane::Bindings) => {
-                " ↑↓/jk·navigate  e/Enter·edit hotkey  n·new  d·delete  Tab·pick app  s·save  q·quit"
+                " ↑↓/jk·navigate  e/Enter·edit hotkey  n·new  d·delete  Tab·pick app  q·save & quit"
             }
             (Mode::Browse, Pane::Apps) => {
-                " ↑↓/jk·navigate  /·search  Enter·assign  Tab/Esc·back  r·refresh  s·save  q·quit"
+                " ↑↓/jk·navigate  /·search  Enter·assign  Tab/Esc·back  r·refresh  q·save & quit"
             }
         }
     };

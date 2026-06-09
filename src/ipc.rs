@@ -31,6 +31,19 @@ pub fn stop() -> Result<()> {
     Ok(())
 }
 
+/// Send reload signal silently — for use inside the TUI.
+/// Returns Ok(true) if a running daemon was found and signalled,
+/// Ok(false) if no daemon was running.
+pub fn reload_quiet() -> Result<bool> {
+    match running_pid() {
+        Ok(pid) => {
+            _reload(pid)?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
 /// Send a reload signal to the running daemon.
 /// Validates the config first so the user sees parse errors immediately
 /// (the daemon would have failed silently and kept the old config).
