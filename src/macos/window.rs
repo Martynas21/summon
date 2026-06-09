@@ -17,10 +17,11 @@ unsafe extern "C" {
 }
 use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
-use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
-use core_foundation_sys::base::{CFRelease, CFRetain, CFTypeRef};
+use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFArrayRef};
+use core_foundation_sys::base::{CFGetTypeID, CFRelease, CFRetain, CFTypeRef};
 use core_foundation_sys::number::{kCFBooleanFalse, kCFBooleanTrue, CFBooleanGetValue};
-use core_foundation_sys::string::CFStringRef;
+use core_foundation_sys::string::{CFStringGetTypeID, CFStringRef};
+use accessibility_sys::AXUIElementGetTypeID;
 use std::ptr;
 
 /// AXUIElement for an application PID. Drops via CFRelease.
@@ -95,6 +96,10 @@ fn copy_windows(app: AXUIElementRef) -> Vec<WindowEl> {
     if err != kAXErrorSuccess || value.is_null() {
         return vec![];
     }
+    if unsafe { CFGetTypeID(value) != CFArrayGetTypeID() } {
+        unsafe { CFRelease(value) };
+        return vec![];
+    }
     let array = value as CFArrayRef;
     let count = unsafe { CFArrayGetCount(array) };
     let mut out = Vec::with_capacity(count as usize);
@@ -123,6 +128,10 @@ fn copy_string_attr(el: AXUIElementRef, key: &str) -> Option<String> {
         AXUIElementCopyAttributeValue(el, attr.as_concrete_TypeRef(), &mut value)
     };
     if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    if unsafe { CFGetTypeID(value) != CFStringGetTypeID() } {
+        unsafe { CFRelease(value) };
         return None;
     }
     let cf = unsafe { CFString::wrap_under_create_rule(value as CFStringRef) };
@@ -224,6 +233,10 @@ pub fn focused_window(app: &AppEl) -> Option<WindowEl> {
         AXUIElementCopyAttributeValue(app.0, attr.as_concrete_TypeRef(), &mut value)
     };
     if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    if unsafe { CFGetTypeID(value) != AXUIElementGetTypeID() } {
+        unsafe { CFRelease(value) };
         return None;
     }
     Some(WindowEl(value as AXUIElementRef))

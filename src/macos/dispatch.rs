@@ -54,7 +54,8 @@ pub unsafe fn async_to_main(ctx: *mut c_void, work: extern "C" fn(*mut c_void)) 
 /// Schedule `work` on the main queue after `ms` milliseconds. Same context
 /// ownership rules as `async_to_main`.
 pub unsafe fn after_main_ms(ms: u64, ctx: *mut c_void, work: extern "C" fn(*mut c_void)) {
-    let when = unsafe { dispatch_time(DISPATCH_TIME_NOW, (ms as i64) * 1_000_000) };
+    let ms_clamped = ms.min(i64::MAX as u64 / 1_000_000);
+    let when = unsafe { dispatch_time(DISPATCH_TIME_NOW, (ms_clamped as i64) * 1_000_000) };
     unsafe { dispatch_after_f(when, main_queue(), ctx, work) };
 }
 
