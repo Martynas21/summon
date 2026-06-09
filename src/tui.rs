@@ -142,10 +142,13 @@ pub fn run() -> Result<()> {
         fs::write(&cfg_path, "[bindings]\n")?;
     }
 
-    let config: Config = fs::read_to_string(&cfg_path)
-        .ok()
-        .and_then(|s| toml::from_str(&s).ok())
-        .unwrap_or_default();
+    let (config, config_err) = match fs::read_to_string(&cfg_path) {
+        Err(_) => (Config::default(), None),
+        Ok(s) => match toml::from_str::<Config>(&s) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => (Config::default(), Some(format!("config parse error: {e}"))),
+        },
+    };
 
     let mut bindings: Vec<(String, String)> = config
         .bindings
@@ -156,6 +159,7 @@ pub fn run() -> Result<()> {
 
     let running_apps = list_platform_apps();
     let mut app = App::new(bindings, running_apps);
+    app.status = config_err;
 
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut app);
@@ -503,8 +507,8 @@ fn render_bindings(frame: &mut Frame, app: &mut App, area: Rect) {
         .bindings
         .iter()
         .map(|(hotkey, ident)| {
-            let app_str = if ident.len() > 28 {
-                format!("{}…", &ident[..27])
+            let app_str = if ident.chars().count() > 28 {
+                format!("{}…", ident.chars().take(27).collect::<String>())
             } else {
                 ident.clone()
             };
@@ -566,8 +570,8 @@ fn render_apps(frame: &mut Frame, app: &mut App, area: Rect) {
             let text = if ident == name {
                 name.clone()
             } else {
-                let short = if ident.len() > 32 {
-                    format!("{}…", &ident[..31])
+                let short = if ident.chars().count() > 32 {
+                    format!("{}…", ident.chars().take(31).collect::<String>())
                 } else {
                     ident.clone()
                 };
