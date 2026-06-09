@@ -3,8 +3,9 @@ use accessibility_sys::{
     kAXMainAttribute, kAXMinimizedAttribute, kAXPositionAttribute, kAXRaiseAction,
     kAXSizeAttribute, kAXStandardWindowSubrole, kAXSubroleAttribute, kAXTitleAttribute,
     kAXWindowsAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize, AXError,
-    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementPerformAction,
-    AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
+    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementGetTypeID,
+    AXUIElementPerformAction, AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue,
+    AXValueRef,
 };
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 use std::ffi::c_void;
@@ -21,7 +22,6 @@ use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetTypeID, CFArrayGetVa
 use core_foundation_sys::base::{CFGetTypeID, CFRelease, CFRetain, CFTypeRef};
 use core_foundation_sys::number::{kCFBooleanFalse, kCFBooleanTrue, CFBooleanGetValue};
 use core_foundation_sys::string::{CFStringGetTypeID, CFStringRef};
-use accessibility_sys::AXUIElementGetTypeID;
 use std::ptr;
 
 /// AXUIElement for an application PID. Drops via CFRelease.
