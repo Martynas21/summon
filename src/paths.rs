@@ -51,3 +51,31 @@ pub fn launch_agent_plist() -> Result<PathBuf> {
 pub fn launch_agent_label() -> &'static str {
     "dev.summon.daemon"
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_file_is_config_toml_in_summon_dir() {
+        let p = config_file().unwrap();
+        assert_eq!(p.file_name().unwrap(), "config.toml");
+        assert!(p.parent().unwrap().ends_with("summon"), "got: {}", p.display());
+    }
+
+    #[test]
+    fn pid_file_lives_in_state_dir() {
+        let p = pid_file().unwrap();
+        assert_eq!(p.file_name().unwrap(), "summon.pid");
+        assert_eq!(p.parent().unwrap(), state_dir().unwrap());
+    }
+
+    #[test]
+    fn log_dir_is_platform_appropriate() {
+        let p = log_dir().unwrap();
+        #[cfg(target_os = "macos")]
+        assert!(p.ends_with("Logs/summon"), "got: {}", p.display());
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(p, state_dir().unwrap().join("Logs"));
+    }
+}

@@ -26,6 +26,10 @@ cargo test                          # all unit tests
 cargo test --lib hotkey_registry    # single test by substring
 cargo test -- --nocapture
 
+./scripts/coverage.sh               # line coverage via cargo-llvm-cov; --html for browsable report
+                                    # one-time: rustup component add llvm-tools-preview
+                                    #           cargo install cargo-llvm-cov --locked
+
 RUST_LOG=debug cargo run -- run     # foreground daemon
 ```
 

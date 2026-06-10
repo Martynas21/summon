@@ -25,6 +25,13 @@ unsafe extern "system" {
 
 const PROCESS_NAME_WIN32: u32 = 0;
 
+/// Apps that own the desktop/shell experience and must never be minimized
+/// by hide_previous. On Windows that's explorer — minimizing it tucks away
+/// the desktop/taskbar itself. (`name` is already a lowercase exe stem.)
+pub fn is_persistent_shell(_bundle_id: &str, name: &str) -> bool {
+    name.eq_ignore_ascii_case("explorer")
+}
+
 /// A running application identified by PID and lowercase exe stem.
 #[derive(Debug, Clone)]
 pub struct RunningApp {
@@ -66,11 +73,8 @@ pub fn find_running_filtered(ident: &str, cmdline_filter: Option<&str>) -> Optio
 }
 
 pub fn launch(ident: &str) -> Result<()> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-
-    let wide_open: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
-    let wide_ident: Vec<u16> = OsStr::new(ident).encode_wide().chain(Some(0)).collect();
+    let wide_open = super::to_wide("open");
+    let wide_ident = super::to_wide(ident);
 
     let result = unsafe {
         ShellExecuteW(

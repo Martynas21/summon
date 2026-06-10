@@ -55,6 +55,14 @@ impl Summoner {
         self.hold_threshold
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn cursor_entry(&mut self, key: String, now: Instant) -> &mut AppCursor {
+        self.cursors.entry(key).or_insert(AppCursor {
+            last_window: None,
+            last_press: now,
+        })
+    }
+
     #[cfg(target_os = "macos")]
     pub fn summon(&mut self, ident: &str, cmdline_filter: Option<&str>) -> Result<()> {
         let running = match app::find_running_filtered(ident, cmdline_filter) {
@@ -81,14 +89,13 @@ impl Summoner {
                 return Ok(());
             }
         };
-        let was_launched = false;
         let pid = app::pid(&running);
         let resolved_bundle = app::bundle_id(&running).unwrap_or_default();
         let resolved_name = app::name(&running).unwrap_or_default();
         // One NSWorkspace round-trip serves both was_active and the log
         // field; the previous version called frontmostApplication twice.
         let frontmost_pid = app::frontmost_pid().unwrap_or(0);
-        let was_active = !was_launched && frontmost_pid == pid;
+        let was_active = frontmost_pid == pid;
         info!(
             ident,
             pid,
@@ -137,48 +144,14 @@ impl Summoner {
         let last_idx = cursor_last
             .and_then(|id| wins.iter().position(|w| w.window_id() == Some(id)));
 
-        // Pick which window to raise/focus.
-        //
-        // Non-cycling priority, applied in order:
-        //   1. Visible window on the active display — user pressed there and
-        //      this app is already visible there; just focus it.
-        //   2. Cursor's last-raised IF on active display — preserves the
-        //      user's history on this monitor. Critical when hide_previous
-        //      has minimized multiple windows of the target app on this
-        //      display: AX order would pick arbitrarily; cursor remembers
-        //      which one was actually theirs.
-        //   3. Any minimized window on the active display — fresh fallback
-        //      when no cursor history points here (e.g. user pressed on B,
-        //      target is min'd on B, but they've never summoned it before).
-        //   4. Cursor's last-raised on any other display — target is fully
-        //      absent from active display; restore it where it was.
-        //   5. First visible window anywhere — no cursor, target not on
-        //      active display, but visible somewhere.
-        //   6. Index 0 — last-resort fallback.
-        //
-        // Cycle (is_rapid same hotkey) bypasses priority and advances the
-        // cursor through ALL windows (minimized picks get unminimized below).
         let active = screen::active_display();
-        let on_active_visible = wins.iter().position(|w| {
-            !window::is_minimized(w) && screen::window_display(w) == Some(active)
-        });
-        let cursor_on_active =
-            last_idx.filter(|&i| screen::window_display(&wins[i]) == Some(active));
-        let on_active_minimized = wins.iter().position(|w| {
-            window::is_minimized(w) && screen::window_display(w) == Some(active)
-        });
-        let any_visible_idx = wins.iter().position(|w| !window::is_minimized(w));
-
-        let idx = if is_rapid && last_idx.is_some() && wins.len() > 1 {
-            (last_idx.unwrap() + 1) % wins.len()
-        } else {
-            on_active_visible
-                .or(cursor_on_active)
-                .or(on_active_minimized)
-                .or(last_idx)
-                .or(any_visible_idx)
-                .unwrap_or(0)
-        };
+        let idx = pick_window_idx(
+            &wins,
+            last_idx,
+            is_rapid,
+            |w| window::is_minimized(w),
+            |w| screen::window_display(w) == Some(active),
+        );
 
         let pick = &wins[idx];
         let was_minimized = window::is_minimized(pick);
@@ -226,8 +199,8 @@ impl Summoner {
                 .as_ref()
                 .and_then(|a| app::name(a))
                 .unwrap_or_default();
-            if prev_bid == "com.apple.finder" {
-                info!(prev_pid = frontmost_pid, "skip minimize: finder");
+            if app::is_persistent_shell(&prev_bid, &prev_name) {
+                info!(prev_pid = frontmost_pid, "skip minimize: persistent shell");
             } else if target_display.is_none() {
                 warn!(
                     prev_pid = frontmost_pid,
@@ -260,11 +233,7 @@ impl Summoner {
                 }
                 if let Some(id) = user_active {
                     let prev_key = cursor_key(&prev_bid, &prev_name);
-                    let entry = self.cursors.entry(prev_key).or_insert(AppCursor {
-                        last_window: None,
-                        last_press: now,
-                    });
-                    entry.last_window = Some(id);
+                    self.cursor_entry(prev_key, now).last_window = Some(id);
                 }
                 info!(
                     prev_pid = frontmost_pid,
@@ -289,10 +258,7 @@ impl Summoner {
             app::activate(&running);
         }
 
-        let cursor = self.cursors.entry(key).or_insert(AppCursor {
-            last_window: None,
-            last_press: now,
-        });
+        let cursor = self.cursor_entry(key, now);
         cursor.last_window = pick.window_id();
         cursor.last_press = now;
         self.last_press = Some((ident.to_string(), now));
@@ -371,26 +337,13 @@ impl Summoner {
             .and_then(|id| wins.iter().position(|w| window::window_id(w) == Some(id)));
 
         let active = screen::active_display();
-        let on_active_visible = wins.iter().position(|w| {
-            !window::is_minimized(w) && screen::window_display(w) == Some(active)
-        });
-        let cursor_on_active =
-            last_idx.filter(|&i| screen::window_display(&wins[i]) == Some(active));
-        let on_active_minimized = wins.iter().position(|w| {
-            window::is_minimized(w) && screen::window_display(w) == Some(active)
-        });
-        let any_visible_idx = wins.iter().position(|w| !window::is_minimized(w));
-
-        let idx = if is_rapid && last_idx.is_some() && wins.len() > 1 {
-            (last_idx.unwrap() + 1) % wins.len()
-        } else {
-            on_active_visible
-                .or(cursor_on_active)
-                .or(on_active_minimized)
-                .or(last_idx)
-                .or(any_visible_idx)
-                .unwrap_or(0)
-        };
+        let idx = pick_window_idx(
+            &wins,
+            last_idx,
+            is_rapid,
+            |w| window::is_minimized(w),
+            |w| screen::window_display(w) == Some(active),
+        );
 
         let pick = &wins[idx];
         let was_minimized = window::is_minimized(pick);
@@ -419,8 +372,8 @@ impl Summoner {
                 .as_ref()
                 .and_then(|a| app::name(a))
                 .unwrap_or_default();
-            if prev_name == "explorer" {
-                info!(prev_pid = frontmost_pid, "skip minimize: explorer");
+            if app::is_persistent_shell("", &prev_name) {
+                info!(prev_pid = frontmost_pid, "skip minimize: persistent shell");
             } else if target_display.is_none() {
                 warn!(prev_pid = frontmost_pid, "skip minimize: target display unknown");
             } else {
@@ -446,11 +399,7 @@ impl Summoner {
                 }
                 if let Some(id) = user_active {
                     let prev_key = cursor_key("", &prev_name);
-                    let entry = self.cursors.entry(prev_key).or_insert(AppCursor {
-                        last_window: None,
-                        last_press: now,
-                    });
-                    entry.last_window = Some(id);
+                    self.cursor_entry(prev_key, now).last_window = Some(id);
                 }
                 info!(
                     prev_pid = frontmost_pid,
@@ -473,10 +422,7 @@ impl Summoner {
             app::activate(&running);
         }
 
-        let cursor = self.cursors.entry(key).or_insert(AppCursor {
-            last_window: None,
-            last_press: now,
-        });
+        let cursor = self.cursor_entry(key, now);
         cursor.last_window = window::window_id(pick);
         cursor.last_press = now;
         self.last_press = Some((ident.to_string(), now));
@@ -582,31 +528,66 @@ impl Summoner {
     }
 }
 
-fn cursor_key(bundle_id: &str, name: &str) -> String {
-    if !bundle_id.is_empty() {
-        bundle_id.to_string()
-    } else {
-        name.to_string()
+/// Pick which window to raise/focus.
+///
+/// Non-cycling priority, applied in order:
+///   1. Visible window on the active display — user pressed there and
+///      this app is already visible there; just focus it.
+///   2. Cursor's last-raised (`last_idx`) IF on active display — preserves
+///      the user's history on this monitor. Critical when hide_previous
+///      has minimized multiple windows of the target app on this display:
+///      enumeration order would pick arbitrarily; cursor remembers which
+///      one was actually theirs.
+///   3. Any minimized window on the active display — fresh fallback when
+///      no cursor history points here (e.g. user pressed on B, target is
+///      min'd on B, but they've never summoned it before).
+///   4. Cursor's last-raised on any other display — target is fully absent
+///      from active display; restore it where it was.
+///   5. First visible window anywhere — no cursor, target not on active
+///      display, but visible somewhere.
+///   6. Index 0 — last-resort fallback.
+///
+/// Cycle (`is_rapid` same hotkey) bypasses priority and advances the cursor
+/// through ALL windows (minimized picks get unminimized by the caller).
+fn pick_window_idx<W>(
+    wins: &[W],
+    last_idx: Option<usize>,
+    is_rapid: bool,
+    is_minimized: impl Fn(&W) -> bool,
+    on_active_display: impl Fn(&W) -> bool,
+) -> usize {
+    if is_rapid && last_idx.is_some() && wins.len() > 1 {
+        return (last_idx.unwrap() + 1) % wins.len();
     }
+    let on_active_visible = wins
+        .iter()
+        .position(|w| !is_minimized(w) && on_active_display(w));
+    let cursor_on_active = last_idx.filter(|&i| on_active_display(&wins[i]));
+    let on_active_minimized = wins
+        .iter()
+        .position(|w| is_minimized(w) && on_active_display(w));
+    let any_visible_idx = wins.iter().position(|w| !is_minimized(w));
+    on_active_visible
+        .or(cursor_on_active)
+        .or(on_active_minimized)
+        .or(last_idx)
+        .or(any_visible_idx)
+        .unwrap_or(0)
+}
+
+fn cursor_key(bundle_id: &str, name: &str) -> String {
+    if bundle_id.is_empty() { name } else { bundle_id }.to_string()
 }
 
 fn derive_cycle_window(configured_ms: u64) -> Duration {
     // 0 = "use the sensible default" (1500ms). Any positive value overrides.
-    if configured_ms == 0 {
-        Duration::from_millis(1500)
-    } else {
-        Duration::from_millis(configured_ms)
-    }
+    Duration::from_millis(if configured_ms == 0 { 1500 } else { configured_ms })
 }
 
 /// 0 means "disabled — fire summon on press, ignore release". Any positive
 /// value enables hold detection at that millisecond threshold.
 fn derive_hold_threshold(configured_ms: u64) -> Option<Duration> {
-    if configured_ms == 0 {
-        None
-    } else {
-        Some(Duration::from_millis(configured_ms))
-    }
+    (configured_ms != 0).then(|| Duration::from_millis(configured_ms))
 }
 
 #[cfg(test)]
@@ -657,6 +638,92 @@ mod tests {
     #[test]
     fn cursor_key_both_empty_gives_empty_string() {
         assert_eq!(cursor_key("", ""), "");
+    }
+
+    // --- pick_window_idx ---
+
+    /// Windows modelled as (is_minimized, on_active_display) tuples.
+    fn pick(wins: &[(bool, bool)], last_idx: Option<usize>, is_rapid: bool) -> usize {
+        pick_window_idx(wins, last_idx, is_rapid, |w| w.0, |w| w.1)
+    }
+
+    #[test]
+    fn rapid_cycle_advances_past_cursor_and_wraps() {
+        let wins = [(false, true), (false, true), (false, true)];
+        assert_eq!(pick(&wins, Some(0), true), 1);
+        assert_eq!(pick(&wins, Some(2), true), 0);
+    }
+
+    #[test]
+    fn rapid_without_cursor_falls_back_to_priority() {
+        let wins = [(true, false), (false, true)];
+        assert_eq!(pick(&wins, None, true), 1);
+    }
+
+    #[test]
+    fn rapid_with_single_window_does_not_cycle() {
+        let wins = [(false, true)];
+        assert_eq!(pick(&wins, Some(0), true), 0);
+    }
+
+    #[test]
+    fn visible_on_active_display_beats_cursor() {
+        // Cursor points at index 2 (also on active), but index 1 is the
+        // first visible window on the active display.
+        let wins = [(true, true), (false, true), (false, true)];
+        assert_eq!(pick(&wins, Some(2), false), 1);
+    }
+
+    #[test]
+    fn cursor_on_active_display_beats_minimized_on_active() {
+        // No visible window on active; cursor (minimized, on active) wins
+        // over the earlier minimized-on-active candidate.
+        let wins = [(true, true), (true, true), (false, false)];
+        assert_eq!(pick(&wins, Some(1), false), 1);
+    }
+
+    #[test]
+    fn minimized_on_active_display_beats_offscreen_cursor() {
+        let wins = [(false, false), (true, true)];
+        assert_eq!(pick(&wins, Some(0), false), 1);
+    }
+
+    #[test]
+    fn cursor_off_active_display_beats_any_visible() {
+        // Nothing on the active display at all; restore the cursor's window
+        // where it was rather than the first visible one.
+        let wins = [(false, false), (true, false)];
+        assert_eq!(pick(&wins, Some(1), false), 1);
+    }
+
+    #[test]
+    fn any_visible_window_when_no_cursor() {
+        let wins = [(true, false), (false, false)];
+        assert_eq!(pick(&wins, None, false), 1);
+    }
+
+    #[test]
+    fn defaults_to_first_window_when_all_minimized_off_display() {
+        let wins = [(true, false), (true, false)];
+        assert_eq!(pick(&wins, None, false), 0);
+    }
+
+    // --- unsupported-platform stubs ---
+
+    #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn summon_errors_on_unsupported_platform() {
+        let mut s = Summoner::new(&cfg_with(Settings::default()));
+        let err = s.summon("foo", None).unwrap_err().to_string();
+        assert!(err.contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn minimize_frontmost_errors_on_unsupported_platform() {
+        let mut s = Summoner::new(&cfg_with(Settings::default()));
+        let err = s.minimize_frontmost("foo", None).unwrap_err().to_string();
+        assert!(err.contains("not supported"), "got: {err}");
     }
 
     // --- Summoner::new ---

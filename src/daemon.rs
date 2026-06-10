@@ -8,6 +8,11 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(target_os = "macos")]
+use crate::macos::dispatch;
+#[cfg(target_os = "windows")]
+use crate::windows::dispatch;
+
+#[cfg(target_os = "macos")]
 struct State {
     summoner: Summoner,
     registry: HotkeyRegistry,
@@ -19,8 +24,33 @@ struct State {
     pending_holds: std::collections::HashMap<u32, ()>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+
+/// Lock the global daemon state, recovering from a poisoned mutex (a prior
+/// handler panicked mid-update; the state is still structurally valid).
+/// `None` only before STATE is initialized.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn lock_state() -> Option<std::sync::MutexGuard<'static, State>> {
+    let guard = match STATE.get()?.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            warn!("STATE mutex poisoned; recovering");
+            e.into_inner()
+        }
+    };
+    Some(guard)
+}
+
+/// Owned copies of the binding fields, so the registry borrow ends before
+/// the caller borrows the summoner mutably.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn binding_for(state: &State, id: u32) -> Option<(String, Option<String>)> {
+    state
+        .registry
+        .target_for(id)
+        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
+}
 
 pub fn run() -> Result<()> {
     init_logging();
@@ -177,13 +207,12 @@ fn run_nsapp() {
     }
 }
 
-/// Bridge global-hotkey's crossbeam channel onto the main queue. The
+/// Bridge global-hotkey's crossbeam channel onto the main queue/pump. The
 /// thread does a blocking `recv` — no polling, no wakeups when idle. Press
 /// and Release events are routed to separate main-thread handlers so the
 /// hold detector can run without bit-packing state into the context pointer.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn spawn_hotkey_forwarder() {
-    use crate::macos::dispatch;
     use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 
     std::thread::Builder::new()
@@ -194,8 +223,8 @@ fn spawn_hotkey_forwarder() {
                 match receiver.recv() {
                     Ok(event) => {
                         // Embed the u32 hotkey id directly in the context
-                        // pointer (always 64-bit on macOS). Avoids a per-event
-                        // heap alloc on the forwarder thread.
+                        // pointer (always 64-bit on both platforms). Avoids a
+                        // per-event heap alloc on the forwarder thread.
                         let ctx = event.id as usize as *mut std::ffi::c_void;
                         match event.state {
                             HotKeyState::Pressed => unsafe {
@@ -216,27 +245,17 @@ fn spawn_hotkey_forwarder() {
         .expect("spawning hotkey forwarder thread");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
-    use crate::macos::dispatch;
     let id = ctx as usize as u32;
-    let Some(state_lock) = STATE.get() else {
+    let Some(mut state) = lock_state() else {
         return;
     };
-    let mut state = match state_lock.lock() {
-        Ok(g) => g,
-        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
-    };
-    let Some((ident, filter)) = state
-        .registry
-        .target_for(id)
-        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
-    else {
+    let Some((ident, filter)) = binding_for(&state, id) else {
         warn!(id, "unmapped hotkey press");
         return;
     };
-    let threshold = state.summoner.hold_threshold();
-    match threshold {
+    match state.summoner.hold_threshold() {
         None => {
             info!(ident, id, "hotkey press (hold disabled)");
             if let Err(e) = state.summoner.summon(&ident, filter.as_deref()) {
@@ -257,25 +276,24 @@ extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
     let id = ctx as usize as u32;
-    let Some(state_lock) = STATE.get() else {
+    let Some(mut state) = lock_state() else {
         return;
-    };
-    let mut state = match state_lock.lock() {
-        Ok(g) => g,
-        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
     };
     if state.pending_holds.remove(&id).is_none() {
         // Timer already fired (or hold disabled — release wasn't tracked).
         return;
     }
-    let Some((ident, filter)) = state
-        .registry
-        .target_for(id)
-        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
-    else {
+    // Cancel the SetTimer so on_hold_fire never fires. macOS has no
+    // equivalent — dispatch_after can't be cancelled; its hold-fire no-ops
+    // on the already-cleared pending entry instead.
+    #[cfg(target_os = "windows")]
+    unsafe {
+        dispatch::cancel_timer(ctx)
+    };
+    let Some((ident, filter)) = binding_for(&state, id) else {
         warn!(id, "unmapped hotkey release");
         return;
     };
@@ -285,26 +303,18 @@ extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 extern "C" fn on_hold_fire(ctx: *mut std::ffi::c_void) {
     let id = ctx as usize as u32;
-    let Some(state_lock) = STATE.get() else {
+    let Some(mut state) = lock_state() else {
         return;
-    };
-    let mut state = match state_lock.lock() {
-        Ok(g) => g,
-        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
     };
     if state.pending_holds.remove(&id).is_none() {
         // Released before threshold (handled by release path) — or reload
         // cleared the map. Either way, no-op.
         return;
     }
-    let Some((ident, filter)) = state
-        .registry
-        .target_for(id)
-        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
-    else {
+    let Some((ident, filter)) = binding_for(&state, id) else {
         warn!(id, "hold fired for unmapped id");
         return;
     };
@@ -314,33 +324,10 @@ extern "C" fn on_hold_fire(ctx: *mut std::ffi::c_void) {
     }
 }
 
-/// Set SIGHUP/SIGTERM/SIGINT to SIG_IGN so default disposition can't
-/// terminate the daemon, then attach a libdispatch signal source per
-/// signal. Sources observe via kqueue regardless of disposition; handlers
-/// run on the main queue, serialized with hotkey handlers.
-#[cfg(target_os = "macos")]
-fn install_signal_sources() {
-    use crate::macos::dispatch;
-    unsafe {
-        libc::signal(libc::SIGHUP, libc::SIG_IGN);
-        libc::signal(libc::SIGTERM, libc::SIG_IGN);
-        libc::signal(libc::SIGINT, libc::SIG_IGN);
-    }
-    dispatch::install_signal_handler(libc::SIGHUP, on_sighup);
-    dispatch::install_signal_handler(libc::SIGTERM, on_shutdown);
-    dispatch::install_signal_handler(libc::SIGINT, on_shutdown);
-}
-
-#[cfg(target_os = "macos")]
-extern "C" fn on_sighup(_ctx: *mut std::ffi::c_void) {
-    info!("SIGHUP received; reloading config");
-    let Some(state_lock) = STATE.get() else {
-        return;
-    };
-    let mut state = match state_lock.lock() {
-        Ok(g) => g,
-        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
-    };
+/// Re-read the config and swap in the new bindings/settings. Shared by the
+/// macOS SIGHUP handler and the Windows reload-event handler.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn apply_reload(state: &mut State) {
     let cfg_path = state.cfg_path.clone();
     match crate::config::load(&cfg_path) {
         Ok(new_cfg) => {
@@ -360,14 +347,35 @@ extern "C" fn on_sighup(_ctx: *mut std::ffi::c_void) {
     }
 }
 
+/// Set SIGHUP/SIGTERM/SIGINT to SIG_IGN so default disposition can't
+/// terminate the daemon, then attach a libdispatch signal source per
+/// signal. Sources observe via kqueue regardless of disposition; handlers
+/// run on the main queue, serialized with hotkey handlers.
+#[cfg(target_os = "macos")]
+fn install_signal_sources() {
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+    }
+    dispatch::install_signal_handler(libc::SIGHUP, on_sighup);
+    dispatch::install_signal_handler(libc::SIGTERM, on_shutdown);
+    dispatch::install_signal_handler(libc::SIGINT, on_shutdown);
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn on_sighup(_ctx: *mut std::ffi::c_void) {
+    info!("SIGHUP received; reloading config");
+    let Some(mut state) = lock_state() else {
+        return;
+    };
+    apply_reload(&mut state);
+}
+
 #[cfg(target_os = "macos")]
 extern "C" fn on_shutdown(_ctx: *mut std::ffi::c_void) {
     info!("SIGTERM/SIGINT received; shutting down");
-    if let Some(state_lock) = STATE.get() {
-        let mut state = match state_lock.lock() {
-            Ok(g) => g,
-            Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
-        };
+    if let Some(mut state) = lock_state() {
         state.registry.unregister_all();
     }
     cleanup_pid_file();
@@ -410,33 +418,14 @@ impl Drop for State {
     }
 }
 
-#[cfg(target_os = "windows")]
-static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-
 /// Called from dispatch.rs window proc when WM_SUMMON_RELOAD is received.
 #[cfg(target_os = "windows")]
 pub fn on_reload_main() {
     info!("reload event received; reloading config");
-    let Some(state_lock) = STATE.get() else {
+    let Some(mut state) = lock_state() else {
         return;
     };
-    let mut state = match state_lock.lock() {
-        Ok(g) => g,
-        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
-    };
-    let cfg_path = state.cfg_path.clone();
-    match crate::config::load(&cfg_path) {
-        Ok(new_cfg) => {
-            state.registry.unregister_all();
-            if let Err(e) = state.registry.register_all(&new_cfg.bindings) {
-                error!("re-registering hotkeys after reload: {e:#}");
-            }
-            state.summoner.reconfigure(&new_cfg);
-            state.pending_holds.clear();
-            info!(bindings = new_cfg.bindings.len(), "reload complete");
-        }
-        Err(e) => error!("reload: failed to parse config: {e:#}"),
-    }
+    apply_reload(&mut state);
 }
 
 #[cfg(target_os = "windows")]
@@ -459,9 +448,7 @@ unsafe extern "system" {
 
 #[cfg(target_os = "windows")]
 fn create_win_event(name: &str) -> Result<usize> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
+    let wide = crate::windows::to_wide(name);
     let handle = unsafe { CreateEventW(std::ptr::null(), 0, 0, wide.as_ptr()) };
     if handle.is_null() {
         anyhow::bail!("CreateEventW failed for {name}");
@@ -495,130 +482,3 @@ fn spawn_ipc_watcher_thread(reload_event: usize, stop_event: usize) {
         .expect("spawning IPC watcher thread");
 }
 
-#[cfg(target_os = "windows")]
-fn spawn_hotkey_forwarder() {
-    use crate::windows::dispatch;
-    use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
-
-    std::thread::Builder::new()
-        .name("summon-hotkey-forwarder".into())
-        .spawn(|| {
-            let receiver = GlobalHotKeyEvent::receiver();
-            loop {
-                match receiver.recv() {
-                    Ok(event) => {
-                        let ctx = event.id as usize as *mut std::ffi::c_void;
-                        match event.state {
-                            HotKeyState::Pressed => unsafe {
-                                dispatch::async_to_main(ctx, on_hotkey_press_main)
-                            },
-                            HotKeyState::Released => unsafe {
-                                dispatch::async_to_main(ctx, on_hotkey_release_main)
-                            },
-                        }
-                    }
-                    Err(e) => {
-                        error!("hotkey channel closed: {e}");
-                        return;
-                    }
-                }
-            }
-        })
-        .expect("spawning hotkey forwarder thread");
-}
-
-#[cfg(target_os = "windows")]
-extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
-    use crate::windows::dispatch;
-    let id = ctx as usize as u32;
-    let Some(state_lock) = STATE.get() else {
-        return;
-    };
-    let mut state = match state_lock.lock() {
-        Ok(g) => g,
-        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
-    };
-    let Some((ident, filter)) = state
-        .registry
-        .target_for(id)
-        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
-    else {
-        warn!(id, "unmapped hotkey press");
-        return;
-    };
-    let threshold = state.summoner.hold_threshold();
-    match threshold {
-        None => {
-            info!(ident, id, "hotkey press (hold disabled)");
-            if let Err(e) = state.summoner.summon(&ident, filter.as_deref()) {
-                warn!(ident, "summon failed: {e:#}");
-            }
-        }
-        Some(d) => {
-            if state.pending_holds.contains_key(&id) {
-                return; // OS key-repeat; ignore
-            }
-            state.pending_holds.insert(id, ());
-            info!(ident, id, threshold_ms = d.as_millis() as u64, "hotkey press (pending)");
-            drop(state);
-            unsafe { dispatch::after_main_ms(d.as_millis() as u64, ctx, on_hold_fire) };
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
-    use crate::windows::dispatch;
-    let id = ctx as usize as u32;
-    let Some(state_lock) = STATE.get() else {
-        return;
-    };
-    let mut state = match state_lock.lock() {
-        Ok(g) => g,
-        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
-    };
-    if state.pending_holds.remove(&id).is_none() {
-        return; // Timer already fired or hold disabled.
-    }
-    // Cancel the SetTimer so on_hold_fire never fires.
-    unsafe { dispatch::cancel_timer(ctx) };
-    let Some((ident, filter)) = state
-        .registry
-        .target_for(id)
-        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
-    else {
-        warn!(id, "unmapped hotkey release");
-        return;
-    };
-    info!(ident, id, "hotkey released → summon");
-    if let Err(e) = state.summoner.summon(&ident, filter.as_deref()) {
-        warn!(ident, "summon failed: {e:#}");
-    }
-}
-
-#[cfg(target_os = "windows")]
-extern "C" fn on_hold_fire(ctx: *mut std::ffi::c_void) {
-    let id = ctx as usize as u32;
-    let Some(state_lock) = STATE.get() else {
-        return;
-    };
-    let mut state = match state_lock.lock() {
-        Ok(g) => g,
-        Err(e) => { warn!("STATE mutex poisoned; recovering"); e.into_inner() }
-    };
-    if state.pending_holds.remove(&id).is_none() {
-        return; // Released before threshold fired (cancel_timer beat us).
-    }
-    let Some((ident, filter)) = state
-        .registry
-        .target_for(id)
-        .map(|t| (t.app.clone(), t.cmdline_contains.clone()))
-    else {
-        warn!(id, "hold fired for unmapped id");
-        return;
-    };
-    info!(ident, id, "hold threshold elapsed → minimize");
-    if let Err(e) = state.summoner.minimize_frontmost(&ident, filter.as_deref()) {
-        warn!(ident, "minimize_frontmost failed: {e:#}");
-    }
-}

@@ -75,24 +75,25 @@ impl App {
         }
     }
 
-    fn navigate_up(&mut self) {
+    /// The active pane's list state and item count.
+    fn pane_list(&mut self) -> (&mut ListState, usize) {
         match self.pane {
-            Pane::Bindings => scroll_up(&mut self.binding_state, self.bindings.len()),
+            Pane::Bindings => (&mut self.binding_state, self.bindings.len()),
             Pane::Apps => {
                 let len = filtered_apps(&self.running_apps, &self.search_buf).len();
-                scroll_up(&mut self.app_state, len);
+                (&mut self.app_state, len)
             }
         }
     }
 
+    fn navigate_up(&mut self) {
+        let (state, len) = self.pane_list();
+        scroll_up(state, len);
+    }
+
     fn navigate_down(&mut self) {
-        match self.pane {
-            Pane::Bindings => scroll_down(&mut self.binding_state, self.bindings.len()),
-            Pane::Apps => {
-                let len = filtered_apps(&self.running_apps, &self.search_buf).len();
-                scroll_down(&mut self.app_state, len);
-            }
-        }
+        let (state, len) = self.pane_list();
+        scroll_down(state, len);
     }
 }
 
@@ -701,4 +702,654 @@ fn list_platform_apps() -> Vec<(String, String)> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn list_platform_apps() -> Vec<(String, String)> {
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn pairs(src: &[(&str, &str)]) -> Vec<(String, String)> {
+        src.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    /// Two bindings, two running apps, bindings pane focused on index 0.
+    fn sample_app() -> App {
+        App::new(
+            pairs(&[("ctrl+1", "Ghostty"), ("ctrl+2", "Google Chrome")]),
+            pairs(&[("com.apple.Safari", "Safari"), ("org.mozilla.firefox", "Firefox")]),
+        )
+    }
+
+    fn render_to_text(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for (i, cell) in buf.content.iter().enumerate() {
+            out.push_str(cell.symbol());
+            if (i + 1) % buf.area.width as usize == 0 {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    // --- construction ---
+
+    #[test]
+    fn new_selects_first_item_in_both_panes() {
+        let app = sample_app();
+        assert_eq!(app.binding_state.selected(), Some(0));
+        assert_eq!(app.app_state.selected(), Some(0));
+        assert!(app.pane == Pane::Bindings);
+        assert!(app.mode == Mode::Browse);
+    }
+
+    #[test]
+    fn new_with_empty_lists_selects_nothing() {
+        let app = App::new(vec![], vec![]);
+        assert_eq!(app.binding_state.selected(), None);
+        assert_eq!(app.app_state.selected(), None);
+    }
+
+    // --- navigation ---
+
+    #[test]
+    fn navigation_wraps_at_both_ends() {
+        let mut app = sample_app();
+        app.navigate_up(); // from 0 wraps to last
+        assert_eq!(app.binding_state.selected(), Some(1));
+        app.navigate_down(); // from last wraps to 0
+        assert_eq!(app.binding_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn navigation_on_empty_list_is_a_noop() {
+        let mut app = App::new(vec![], vec![]);
+        app.navigate_up();
+        app.navigate_down();
+        assert_eq!(app.binding_state.selected(), None);
+    }
+
+    #[test]
+    fn navigation_respects_search_filter_length() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        app.search_buf = "safari".into(); // filters to 1 app
+        app.navigate_down(); // single item: wraps onto itself
+        assert_eq!(app.app_state.selected(), Some(0));
+    }
+
+    // --- app filtering ---
+
+    #[test]
+    fn empty_query_returns_all_apps() {
+        let apps = pairs(&[("a", "A"), ("b", "B")]);
+        assert_eq!(filtered_apps(&apps, "").len(), 2);
+    }
+
+    #[test]
+    fn filter_matches_name_and_ident_case_insensitively() {
+        let apps = pairs(&[("com.apple.Safari", "Safari"), ("org.mozilla.firefox", "Firefox")]);
+        assert_eq!(filtered_apps(&apps, "SAFARI").len(), 1);
+        assert_eq!(filtered_apps(&apps, "mozilla").len(), 1); // matches ident, not name
+        assert_eq!(filtered_apps(&apps, "zzz").len(), 0);
+    }
+
+    // --- browse mode: bindings pane ---
+
+    #[test]
+    fn tab_switches_to_apps_pane() {
+        let mut app = sample_app();
+        assert!(!handle_browse(&mut app, KeyCode::Tab).unwrap());
+        assert!(app.pane == Pane::Apps);
+    }
+
+    #[test]
+    fn n_starts_a_new_binding_input() {
+        let mut app = sample_app();
+        handle_browse(&mut app, KeyCode::Char('n')).unwrap();
+        assert!(app.mode == Mode::InputHotkey);
+        assert!(app.hotkey_is_new);
+        assert_eq!(app.hotkey_buf, "");
+    }
+
+    #[test]
+    fn enter_edits_selected_binding_hotkey() {
+        let mut app = sample_app();
+        handle_browse(&mut app, KeyCode::Enter).unwrap();
+        assert!(app.mode == Mode::InputHotkey);
+        assert!(!app.hotkey_is_new);
+        assert_eq!(app.hotkey_edit_idx, Some(0));
+        assert_eq!(app.hotkey_buf, "ctrl+1");
+    }
+
+    #[test]
+    fn d_with_selection_asks_for_delete_confirmation() {
+        let mut app = sample_app();
+        handle_browse(&mut app, KeyCode::Char('d')).unwrap();
+        assert!(app.mode == Mode::ConfirmDelete);
+    }
+
+    #[test]
+    fn d_with_no_bindings_does_nothing() {
+        let mut app = App::new(vec![], pairs(&[("a", "A")]));
+        handle_browse(&mut app, KeyCode::Char('d')).unwrap();
+        assert!(app.mode == Mode::Browse);
+    }
+
+    #[test]
+    fn esc_quits_without_saving() {
+        let mut app = sample_app();
+        assert!(handle_browse(&mut app, KeyCode::Esc).unwrap());
+    }
+
+    // --- hotkey input mode ---
+
+    #[test]
+    fn typed_chars_are_lowercased_and_non_hotkey_chars_dropped() {
+        let mut app = sample_app();
+        for c in ['C', 't', 'r', 'l', '+', '!', ' ', '3'] {
+            handle_input_hotkey(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.hotkey_buf, "ctrl+3");
+    }
+
+    #[test]
+    fn backspace_removes_last_char() {
+        let mut app = sample_app();
+        app.hotkey_buf = "ctrl+1".into();
+        handle_input_hotkey(&mut app, KeyCode::Backspace);
+        assert_eq!(app.hotkey_buf, "ctrl+");
+    }
+
+    #[test]
+    fn esc_cancels_hotkey_input() {
+        let mut app = sample_app();
+        app.mode = Mode::InputHotkey;
+        app.hotkey_buf = "ctrl+9".into();
+        handle_input_hotkey(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Browse);
+        assert_eq!(app.hotkey_buf, "");
+    }
+
+    #[test]
+    fn submitting_empty_hotkey_prompts_for_input() {
+        let mut app = sample_app();
+        app.mode = Mode::InputHotkey;
+        handle_input_hotkey(&mut app, KeyCode::Enter);
+        assert!(app.status.as_deref().unwrap().contains("Type a hotkey"));
+        assert!(app.mode == Mode::InputHotkey, "should stay in input mode");
+    }
+
+    #[test]
+    fn submitting_invalid_hotkey_reports_error() {
+        let mut app = sample_app();
+        app.mode = Mode::InputHotkey;
+        app.hotkey_buf = "1".into(); // no modifier
+        handle_input_hotkey(&mut app, KeyCode::Enter);
+        assert!(app.status.as_deref().unwrap().contains("Invalid"));
+    }
+
+    #[test]
+    fn submitting_duplicate_hotkey_is_rejected_after_normalisation() {
+        let mut app = sample_app();
+        app.mode = Mode::InputHotkey;
+        app.hotkey_is_new = true;
+        app.hotkey_buf = "control+1".into(); // normalises to existing ctrl+1
+        handle_input_hotkey(&mut app, KeyCode::Enter);
+        assert!(app.status.as_deref().unwrap().contains("already bound"));
+        assert_eq!(app.bindings.len(), 2, "no binding added");
+    }
+
+    #[test]
+    fn new_valid_hotkey_adds_placeholder_and_moves_to_app_pane() {
+        let mut app = sample_app();
+        app.mode = Mode::InputHotkey;
+        app.hotkey_is_new = true;
+        app.hotkey_buf = "ctrl+3".into();
+        handle_input_hotkey(&mut app, KeyCode::Enter);
+        assert!(app.pane == Pane::Apps);
+        assert!(app.mode == Mode::Browse);
+        assert_eq!(app.pending_hotkey.as_deref(), Some("ctrl+3"));
+        let entry = app.bindings.iter().find(|(k, _)| k == "ctrl+3").unwrap();
+        assert_eq!(entry.1, "—");
+        // selection follows the new (sorted-in) entry
+        assert_eq!(app.binding_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn editing_hotkey_renames_binding_in_place() {
+        let mut app = sample_app();
+        app.mode = Mode::InputHotkey;
+        app.hotkey_is_new = false;
+        app.hotkey_edit_idx = Some(0);
+        app.hotkey_buf = "ctrl+9".into();
+        handle_input_hotkey(&mut app, KeyCode::Enter);
+        assert!(app.dirty);
+        let entry = app.bindings.iter().find(|(k, _)| k == "ctrl+9").unwrap();
+        assert_eq!(entry.1, "Ghostty", "app keeps its binding under the new hotkey");
+        assert!(!app.bindings.iter().any(|(k, _)| k == "ctrl+1"));
+        assert!(app.status.as_deref().unwrap().contains("Hotkey updated"));
+    }
+
+    #[test]
+    fn editing_can_resubmit_same_hotkey_without_duplicate_error() {
+        let mut app = sample_app();
+        app.mode = Mode::InputHotkey;
+        app.hotkey_is_new = false;
+        app.hotkey_edit_idx = Some(0);
+        app.hotkey_buf = "ctrl+1".into(); // unchanged
+        handle_input_hotkey(&mut app, KeyCode::Enter);
+        assert!(app.status.as_deref().unwrap().contains("Hotkey updated"));
+    }
+
+    // --- delete confirmation ---
+
+    #[test]
+    fn confirming_delete_removes_binding_and_clamps_selection() {
+        let mut app = sample_app();
+        app.binding_state.select(Some(1)); // last entry
+        app.mode = Mode::ConfirmDelete;
+        handle_confirm_delete(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.bindings.len(), 1);
+        assert_eq!(app.binding_state.selected(), Some(0), "selection clamped");
+        assert!(app.dirty);
+        assert!(app.status.as_deref().unwrap().contains("Deleted ctrl+2"));
+        assert!(app.mode == Mode::Browse);
+    }
+
+    #[test]
+    fn deleting_last_binding_clears_selection() {
+        let mut app = App::new(pairs(&[("ctrl+1", "Ghostty")]), vec![]);
+        app.mode = Mode::ConfirmDelete;
+        handle_confirm_delete(&mut app, KeyCode::Char('y'));
+        assert!(app.bindings.is_empty());
+        assert_eq!(app.binding_state.selected(), None);
+    }
+
+    #[test]
+    fn any_other_key_cancels_delete() {
+        let mut app = sample_app();
+        app.mode = Mode::ConfirmDelete;
+        handle_confirm_delete(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.bindings.len(), 2);
+        assert!(app.mode == Mode::Browse);
+    }
+
+    // --- apps pane: search ---
+
+    #[test]
+    fn slash_opens_search_and_typing_filters() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        handle_browse(&mut app, KeyCode::Char('/')).unwrap();
+        assert!(app.search_active);
+        for c in "fire".chars() {
+            handle_browse(&mut app, KeyCode::Char(c)).unwrap();
+        }
+        assert_eq!(app.search_buf, "fire");
+        assert_eq!(filtered_apps(&app.running_apps, &app.search_buf).len(), 1);
+        assert_eq!(app.app_state.selected(), Some(0), "selection reset to filtered top");
+    }
+
+    #[test]
+    fn search_backspace_pops_and_esc_clears() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        app.search_active = true;
+        app.search_buf = "fire".into();
+        handle_browse(&mut app, KeyCode::Backspace).unwrap();
+        assert_eq!(app.search_buf, "fir");
+        handle_browse(&mut app, KeyCode::Esc).unwrap();
+        assert_eq!(app.search_buf, "");
+        assert!(!app.search_active);
+    }
+
+    #[test]
+    fn search_enter_keeps_filter_but_closes_input() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        app.search_active = true;
+        app.search_buf = "safari".into();
+        handle_browse(&mut app, KeyCode::Enter).unwrap();
+        assert!(!app.search_active);
+        assert_eq!(app.search_buf, "safari");
+    }
+
+    // --- assigning apps to bindings ---
+
+    #[test]
+    fn enter_assigns_selected_app_to_selected_binding() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        handle_browse(&mut app, KeyCode::Enter).unwrap();
+        assert_eq!(app.bindings[0].1, "com.apple.Safari");
+        assert!(app.dirty);
+        assert!(app.pane == Pane::Bindings);
+        assert!(app.status.as_deref().unwrap().contains("Assigned"));
+    }
+
+    #[test]
+    fn assign_respects_search_filter() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        app.search_buf = "firefox".into();
+        reset_app_selection(&mut app);
+        assign_selected_app(&mut app);
+        assert_eq!(app.bindings[0].1, "org.mozilla.firefox");
+    }
+
+    #[test]
+    fn assign_without_binding_selected_warns() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        app.binding_state.select(None);
+        assign_selected_app(&mut app);
+        assert!(app.status.as_deref().unwrap().contains("No binding selected"));
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn cancelling_new_binding_removes_placeholder() {
+        let mut app = sample_app();
+        // Full new-binding flow: n → type ctrl+3 → Enter → Esc in apps pane.
+        handle_browse(&mut app, KeyCode::Char('n')).unwrap();
+        for c in "ctrl+3".chars() {
+            handle_input_hotkey(&mut app, KeyCode::Char(c));
+        }
+        handle_input_hotkey(&mut app, KeyCode::Enter);
+        assert_eq!(app.bindings.len(), 3);
+        handle_browse(&mut app, KeyCode::Esc).unwrap();
+        assert_eq!(app.bindings.len(), 2, "placeholder removed");
+        assert!(app.pending_hotkey.is_none());
+        assert!(app.pane == Pane::Bindings);
+        assert!(app.status.as_deref().unwrap().contains("Cancelled"));
+    }
+
+    #[test]
+    fn tab_from_apps_returns_to_bindings_without_pending() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        handle_browse(&mut app, KeyCode::Tab).unwrap();
+        assert!(app.pane == Pane::Bindings);
+        assert_eq!(app.bindings.len(), 2);
+    }
+
+    // --- edge cases: stale selections, no-op keys ---
+
+    #[test]
+    fn arrow_keys_navigate_bindings_pane() {
+        let mut app = sample_app();
+        handle_browse(&mut app, KeyCode::Down).unwrap();
+        assert_eq!(app.binding_state.selected(), Some(1));
+        handle_browse(&mut app, KeyCode::Up).unwrap();
+        assert_eq!(app.binding_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn arrow_keys_navigate_apps_pane_even_during_search() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        handle_browse(&mut app, KeyCode::Down).unwrap();
+        assert_eq!(app.app_state.selected(), Some(1));
+        handle_browse(&mut app, KeyCode::Up).unwrap();
+        assert_eq!(app.app_state.selected(), Some(0));
+        app.search_active = true;
+        handle_browse(&mut app, KeyCode::Down).unwrap();
+        assert_eq!(app.app_state.selected(), Some(1));
+        handle_browse(&mut app, KeyCode::Up).unwrap();
+        assert_eq!(app.app_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn unhandled_keys_are_ignored_in_every_browse_state() {
+        let mut app = sample_app();
+        assert!(!handle_browse(&mut app, KeyCode::F(1)).unwrap());
+        app.pane = Pane::Apps;
+        assert!(!handle_browse(&mut app, KeyCode::F(1)).unwrap());
+        app.search_active = true;
+        assert!(!handle_browse(&mut app, KeyCode::F(1)).unwrap());
+        assert!(app.mode == Mode::Browse);
+    }
+
+    #[test]
+    fn edit_with_no_selection_is_a_noop() {
+        let mut app = App::new(vec![], vec![]);
+        handle_browse(&mut app, KeyCode::Enter).unwrap();
+        assert!(app.mode == Mode::Browse);
+    }
+
+    #[test]
+    fn non_character_keys_are_ignored_during_hotkey_input() {
+        let mut app = sample_app();
+        handle_input_hotkey(&mut app, KeyCode::Tab);
+        assert_eq!(app.hotkey_buf, "");
+    }
+
+    #[test]
+    fn editing_with_stale_index_changes_nothing() {
+        let mut app = sample_app();
+        app.mode = Mode::InputHotkey;
+        app.hotkey_is_new = false;
+        app.hotkey_edit_idx = Some(9);
+        app.hotkey_buf = "ctrl+9".into();
+        handle_input_hotkey(&mut app, KeyCode::Enter);
+        assert!(!app.dirty);
+        assert!(app.mode == Mode::Browse, "still exits input mode");
+    }
+
+    #[test]
+    fn editing_with_no_index_changes_nothing() {
+        let mut app = sample_app();
+        app.mode = Mode::InputHotkey;
+        app.hotkey_is_new = false;
+        app.hotkey_edit_idx = None;
+        app.hotkey_buf = "ctrl+9".into();
+        handle_input_hotkey(&mut app, KeyCode::Enter);
+        assert!(!app.dirty);
+        assert_eq!(app.bindings.len(), 2);
+        assert!(app.mode == Mode::Browse);
+    }
+
+    #[test]
+    fn confirming_delete_with_stale_selection_only_exits_mode() {
+        let mut app = sample_app();
+        app.binding_state.select(Some(9));
+        app.mode = Mode::ConfirmDelete;
+        handle_confirm_delete(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.bindings.len(), 2);
+        assert!(app.mode == Mode::Browse);
+    }
+
+    #[test]
+    fn assign_with_no_app_selected_is_a_noop() {
+        let mut app = sample_app();
+        app.app_state.select(None);
+        assign_selected_app(&mut app);
+        assert_eq!(app.bindings[0].1, "Ghostty");
+    }
+
+    #[test]
+    fn assign_with_stale_app_selection_is_a_noop() {
+        let mut app = sample_app();
+        app.app_state.select(Some(9));
+        assign_selected_app(&mut app);
+        assert_eq!(app.bindings[0].1, "Ghostty");
+    }
+
+    #[test]
+    fn assign_with_stale_binding_selection_is_a_noop() {
+        let mut app = sample_app();
+        app.binding_state.select(Some(9));
+        assign_selected_app(&mut app);
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn cancelling_the_only_new_binding_clears_selection() {
+        let mut app = App::new(vec![], vec![]);
+        handle_browse(&mut app, KeyCode::Char('n')).unwrap();
+        for c in "ctrl+1".chars() {
+            handle_input_hotkey(&mut app, KeyCode::Char(c));
+        }
+        handle_input_hotkey(&mut app, KeyCode::Enter);
+        assert_eq!(app.bindings.len(), 1);
+        cancel_app_selection(&mut app);
+        assert!(app.bindings.is_empty());
+        assert_eq!(app.binding_state.selected(), None);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn refresh_reloads_platform_app_list_and_clears_search() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        app.search_buf = "saf".into();
+        app.search_active = false;
+        handle_browse(&mut app, KeyCode::Char('r')).unwrap();
+        assert!(app.running_apps.is_empty(), "stub platform lists no apps");
+        assert_eq!(app.search_buf, "");
+        assert!(app.status.as_deref().unwrap().contains("Refreshed"));
+    }
+
+    // --- rendering (in-memory TestBackend, no terminal) ---
+
+    #[test]
+    fn render_shows_bindings_and_apps() {
+        let mut app = sample_app();
+        let text = render_to_text(&mut app);
+        assert!(text.contains("Bindings (2)"), "got:\n{text}");
+        assert!(text.contains("ctrl+1"));
+        assert!(text.contains("Ghostty"));
+        assert!(text.contains("Running Apps (2)"));
+        assert!(text.contains("Safari (com.apple.Safari)"));
+    }
+
+    #[test]
+    fn render_truncates_long_idents() {
+        let mut app = App::new(
+            pairs(&[("ctrl+1", "an.extremely.long.bundle.identifier.that.never.ends")]),
+            vec![],
+        );
+        let text = render_to_text(&mut app);
+        assert!(text.contains("…"), "got:\n{text}");
+    }
+
+    #[test]
+    fn render_hotkey_input_shows_validity_indicator() {
+        let mut app = sample_app();
+        app.mode = Mode::InputHotkey;
+        app.hotkey_is_new = true;
+        app.hotkey_buf = "ctrl+3".into();
+        let text = render_to_text(&mut app);
+        assert!(text.contains("New binding hotkey: ctrl+3 ✓"), "got:\n{text}");
+        app.hotkey_buf = "bogus".into();
+        let text = render_to_text(&mut app);
+        assert!(text.contains("✗"), "got:\n{text}");
+    }
+
+    #[test]
+    fn render_confirm_delete_names_the_binding() {
+        let mut app = sample_app();
+        app.mode = Mode::ConfirmDelete;
+        let text = render_to_text(&mut app);
+        assert!(text.contains("Delete 'ctrl+1 → Ghostty'? [y/N]"), "got:\n{text}");
+    }
+
+    #[test]
+    fn render_apps_pane_shows_pending_hotkey_guidance() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        app.pending_hotkey = Some("ctrl+3".into());
+        let text = render_to_text(&mut app);
+        assert!(text.contains("New binding 'ctrl+3'"), "got:\n{text}");
+    }
+
+    #[test]
+    fn render_search_title_shows_query_and_counts() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        app.search_active = true;
+        app.search_buf = "saf".into();
+        let text = render_to_text(&mut app);
+        assert!(text.contains("Apps (1/2)"), "got:\n{text}");
+        assert!(text.contains("/saf"), "got:\n{text}");
+    }
+
+    #[test]
+    fn render_apps_title_keeps_filter_after_search_closes() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        app.search_active = false;
+        app.search_buf = "saf".into();
+        let text = render_to_text(&mut app);
+        assert!(text.contains("Apps (1/2) — /saf"), "got:\n{text}");
+    }
+
+    #[test]
+    fn render_shows_placeholder_binding() {
+        let mut app = App::new(pairs(&[("ctrl+3", "—")]), vec![]);
+        let text = render_to_text(&mut app);
+        assert!(text.contains("ctrl+3"), "got:\n{text}");
+        assert!(text.contains("—"), "got:\n{text}");
+    }
+
+    #[test]
+    fn render_apps_shows_plain_name_when_ident_equals_name() {
+        let mut app = App::new(vec![], pairs(&[("firefox", "firefox")]));
+        let text = render_to_text(&mut app);
+        assert!(text.contains("firefox"), "got:\n{text}");
+        assert!(!text.contains("firefox (firefox)"), "got:\n{text}");
+    }
+
+    #[test]
+    fn render_truncates_long_app_idents_in_apps_pane() {
+        let mut app = App::new(
+            vec![],
+            pairs(&[("an.extremely.long.bundle.identifier.example", "Long App")]),
+        );
+        let text = render_to_text(&mut app);
+        assert!(text.contains("Long App ("), "got:\n{text}");
+        assert!(text.contains("…"), "got:\n{text}");
+    }
+
+    #[test]
+    fn render_clamps_stale_selection_to_last_binding() {
+        // The stateful List widget clamps an out-of-range selection during
+        // render, so the status line sees the clamped index, not the stale one.
+        let mut app = sample_app();
+        app.mode = Mode::ConfirmDelete;
+        app.binding_state.select(Some(9));
+        let text = render_to_text(&mut app);
+        assert!(text.contains("Delete 'ctrl+2 → Google Chrome'? [y/N]"), "got:\n{text}");
+        app.binding_state.select(None);
+        let text = render_to_text(&mut app);
+        assert!(!text.contains("Delete '"), "got:\n{text}");
+    }
+
+    #[test]
+    fn render_empty_hotkey_input_shows_no_validity_indicator() {
+        let mut app = sample_app();
+        app.mode = Mode::InputHotkey;
+        app.hotkey_is_new = false;
+        let text = render_to_text(&mut app);
+        assert!(text.contains("Edit hotkey:"), "got:\n{text}");
+        assert!(!text.contains('✓') && !text.contains('✗'), "got:\n{text}");
+    }
+
+    #[test]
+    fn render_apps_pane_status_reflects_binding_selection() {
+        let mut app = sample_app();
+        app.pane = Pane::Apps;
+        let text = render_to_text(&mut app);
+        assert!(text.contains("Enter assigns to 'ctrl+1'"), "got:\n{text}");
+        app.binding_state.select(Some(9)); // clamped to last entry by the List render
+        let text = render_to_text(&mut app);
+        assert!(text.contains("Enter assigns to 'ctrl+2'"), "got:\n{text}");
+        app.binding_state.select(None);
+        let text = render_to_text(&mut app);
+        assert!(text.contains("No binding selected"), "got:\n{text}");
+    }
 }

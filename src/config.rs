@@ -217,6 +217,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn load_parses_config_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, r#"
+            [bindings]
+            "ctrl+1" = "Ghostty"
+        "#).unwrap();
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.bindings[0].app, "Ghostty");
+    }
+
+    #[test]
+    fn load_missing_file_names_path_in_error() {
+        let err = load(Path::new("/nonexistent/summon-test-config.toml")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("summon-test-config.toml"), "got: {msg}");
+    }
+
+    #[test]
     fn parses_simple_binding() {
         let src = r#"
             [bindings]
@@ -309,6 +328,24 @@ mod tests {
             "ctrl+nope" = "Foo"
         "#;
         let err = parse_str(src).unwrap_err().to_string();
+        assert!(err.contains("unknown key"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_named_keys() {
+        assert_eq!(parse_hotkey("ctrl+space").unwrap().key, "space");
+        assert_eq!(parse_hotkey("ctrl+PageDown").unwrap().key, "pagedown");
+    }
+
+    #[test]
+    fn rejects_function_key_out_of_range() {
+        let err = parse_hotkey("ctrl+f21").unwrap_err().to_string();
+        assert!(err.contains("unknown key"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_f_prefixed_non_numeric_key() {
+        let err = parse_hotkey("ctrl+fork").unwrap_err().to_string();
         assert!(err.contains("unknown key"), "got: {err}");
     }
 

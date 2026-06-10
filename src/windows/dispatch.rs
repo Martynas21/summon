@@ -2,8 +2,7 @@
 /// Mirrors the macOS libdispatch interface used in daemon.rs.
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::ffi::{c_void, OsStr};
-use std::os::windows::ffi::OsStrExt;
+use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -91,10 +90,8 @@ fn msg_hwnd() -> HWND {
 }
 
 unsafe fn create_hwnd() -> Result<usize> {
-    let class_name: Vec<u16> = OsStr::new("SummonMsgWnd")
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    // Used as both the class name and the window name below.
+    let class_name = super::to_wide("SummonMsgWnd");
 
     let hinstance = GetModuleHandleW(std::ptr::null());
 
@@ -112,18 +109,13 @@ unsafe fn create_hwnd() -> Result<usize> {
     };
     RegisterClassW(&wc);
 
-    let window_name: Vec<u16> = OsStr::new("SummonMsgWnd")
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-
     // HWND_MESSAGE = (HWND)(-3)
     let hwnd_message: HWND = (-3isize) as HWND;
 
     let hwnd = CreateWindowExW(
         0,
         class_name.as_ptr(),
-        window_name.as_ptr(),
+        class_name.as_ptr(),
         0,
         0, 0, 0, 0,
         hwnd_message,

@@ -39,8 +39,7 @@ impl CycleState {
         });
         let stale = self
             .reset_after
-            .map(|d| now.duration_since(entry.last_press) > d)
-            .unwrap_or(false);
+            .is_some_and(|d| now.duration_since(entry.last_press) > d);
         if stale {
             entry.cursor = 0;
         } else {
@@ -138,6 +137,22 @@ mod tests {
         assert_eq!(s.touch("a", 3), 2);
         assert_eq!(s.touch("a", 3), 2);
         assert_eq!(s.current("a"), 2);
+    }
+
+    #[test]
+    fn touch_with_zero_windows_returns_zero() {
+        let mut s = CycleState::new(0);
+        s.advance("a", 3);
+        assert_eq!(s.touch("a", 0), 0);
+    }
+
+    #[test]
+    fn touch_resets_cursor_after_threshold() {
+        let mut s = CycleState::new(50);
+        s.advance("a", 3);
+        s.advance("a", 3); // cursor → 2
+        sleep(Duration::from_millis(80));
+        assert_eq!(s.touch("a", 3), 0);
     }
 
     #[test]

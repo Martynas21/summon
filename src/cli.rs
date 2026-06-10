@@ -208,3 +208,72 @@ fn edit() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_every_subcommand() {
+        for (args, want) in [
+            (&["summon", "run"][..], "Run"),
+            (&["summon", "install"], "Install"),
+            (&["summon", "uninstall"], "Uninstall"),
+            (&["summon", "reload"], "Reload"),
+            (&["summon", "stop"], "Stop"),
+            (&["summon", "status"], "Status"),
+            (&["summon", "edit"], "Edit"),
+            (&["summon", "manage"], "Manage"),
+            (&["summon", "_grant"], "Grant"),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(format!("{:?}", cli.cmd), want, "args: {args:?}");
+        }
+    }
+
+    #[test]
+    fn missing_subcommand_is_an_error() {
+        assert!(Cli::try_parse_from(["summon"]).is_err());
+    }
+
+    #[test]
+    fn unknown_subcommand_is_an_error() {
+        assert!(Cli::try_parse_from(["summon", "frobnicate"]).is_err());
+    }
+
+    #[test]
+    fn validate_path_argument_is_optional() {
+        let cli = Cli::try_parse_from(["summon", "validate", "/tmp/x.toml"]).unwrap();
+        match cli.cmd {
+            Cmd::Validate { path } => assert_eq!(path, Some(PathBuf::from("/tmp/x.toml"))),
+            other => panic!("expected Validate, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["summon", "validate"]).unwrap();
+        match cli.cmd {
+            Cmd::Validate { path } => assert_eq!(path, None),
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_config_template_is_valid_toml_with_no_bindings() {
+        let cfg = crate::config::parse_str(default_config()).unwrap();
+        assert!(cfg.bindings.is_empty());
+    }
+
+    #[test]
+    fn validate_accepts_valid_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[bindings]\n\"ctrl+1\" = \"Ghostty\"\n").unwrap();
+        validate(Some(path)).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_invalid_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "not valid toml [").unwrap();
+        assert!(validate(Some(path)).is_err());
+    }
+}

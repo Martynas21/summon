@@ -7,19 +7,30 @@ description: Write or review Rust unit tests for the summon project. Use when ad
 
 ## What to test
 
-Only test **pure functions** — code that takes inputs and returns outputs with no OS calls, no I/O,
-and no side effects. Mocking OS APIs tests the mock, not the code.
+Test **our code's outcomes**: every function whose behaviour we own should have its observable
+results verified through the public API. Never test OS methods themselves, and never mock them —
+mocking OS APIs tests the mock, not the code.
 
-**Safe to test:**
+**Test (our logic, observable outcomes):**
 - Parsing and validation (`config.rs` — hotkey strings, TOML)
 - State machines (`cycle_state.rs`, hold-threshold logic in `summoner.rs`)
 - Data transformations (key/modifier mapping in `hotkey.rs`)
 - String derivation (`cursor_key`, `derive_cycle_window`)
 - Constructor field wiring (`Summoner::new`, `Summoner::reconfigure`)
+- File-reading wrappers around our own parsing (`config::load`, `ipc::running_pid_at`) —
+  use real temp files (`tempfile` is a dev-dependency), not mocks
+- CLI argument parsing (`cli.rs` — `Cli::try_parse_from`, the default config template)
+- Path derivation (`paths.rs` — file names, dir relationships)
+- The TUI state machine (`tui.rs` — `handle_*` key handlers operating on `App`)
+- TUI rendering — via ratatui's in-memory `TestBackend`; render and assert on buffer text
 
-**Do NOT test** (OS-heavy, no unit tests):
-- `daemon.rs` — message pump, signal handlers
-- `ipc.rs` — PID file, signals, named events
+**Do NOT test** (the behaviour under test would be the OS's, not ours):
+- `daemon.rs` — message pump, signal handlers, process lifecycle
+- `ipc.rs` signal senders (`stop`, `reload`, `reload_quiet`) — they signal real processes,
+  and the zero-arg wrappers read the user's real state dir
+- `tui.rs` `run`/`event_loop`/`save_config` — real terminal, real config path
+- `cli.rs` `run` dispatch and `status`/`edit`/`install` — spawn editors, query the daemon
+- `hotkey.rs` `HotkeyRegistry` — wraps `GlobalHotKeyManager`; needs a display server to register
 - `macos/*` — Accessibility API, NSWorkspace, dispatch
 - `windows/*` — Win32 EnumWindows, SetForegroundWindow, etc.
 

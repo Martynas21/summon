@@ -6,6 +6,13 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+/// Apps that own the desktop/shell experience and must never be minimized
+/// by hide_previous. On macOS that's Finder — minimizing it tucks away the
+/// desktop itself.
+pub fn is_persistent_shell(bundle_id: &str, _name: &str) -> bool {
+    bundle_id == "com.apple.finder"
+}
+
 /// A bundle id contains a dot and no whitespace (com.foo.bar).
 pub fn looks_like_bundle_id(s: &str) -> bool {
     s.contains('.') && !s.chars().any(char::is_whitespace)

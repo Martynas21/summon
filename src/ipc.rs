@@ -1,10 +1,13 @@
 use anyhow::{anyhow, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Read the PID file and return the pid of the running daemon (if any).
 pub fn running_pid() -> Result<u32> {
-    let path = crate::paths::pid_file()?;
-    let raw = std::fs::read_to_string(&path)
+    running_pid_at(&crate::paths::pid_file()?)
+}
+
+fn running_pid_at(path: &Path) -> Result<u32> {
+    let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading pid file {}", path.display()))?;
     let pid: u32 = raw
         .trim()
@@ -154,10 +157,8 @@ fn _reload(pid: u32) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn open_named_event(name: &str) -> Result<*mut std::ffi::c_void> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
     const EVENT_MODIFY_STATE: u32 = 0x0002;
-    let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(std::iter::once(0)).collect();
+    let wide = crate::windows::to_wide(name);
     let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr()) };
     if handle.is_null() {
         anyhow::bail!("OpenEventW failed for {name}");
@@ -177,4 +178,51 @@ fn set_and_close_event(handle: *mut std::ffi::c_void) -> Result<()> {
         CloseHandle(handle);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_pid_file(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("summon.pid");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn running_pid_returns_pid_of_live_process() {
+        let me = std::process::id();
+        let (_dir, path) = write_pid_file(&format!("{me}\n"));
+        assert_eq!(running_pid_at(&path).unwrap(), me);
+    }
+
+    #[test]
+    fn running_pid_rejects_dead_process_as_stale() {
+        // Far above any real pid limit, but still a positive i32 so the
+        // liveness check targets a single (nonexistent) process.
+        let (_dir, path) = write_pid_file("99999999");
+        let err = running_pid_at(&path).unwrap_err().to_string();
+        assert!(err.contains("stale pid file"), "got: {err}");
+    }
+
+    #[test]
+    fn running_pid_rejects_garbage_contents() {
+        let (_dir, path) = write_pid_file("not-a-pid");
+        let err = format!("{:#}", running_pid_at(&path).unwrap_err());
+        assert!(err.contains("invalid pid file contents"), "got: {err}");
+    }
+
+    #[test]
+    fn running_pid_errors_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = format!("{:#}", running_pid_at(&dir.path().join("none.pid")).unwrap_err());
+        assert!(err.contains("reading pid file"), "got: {err}");
+    }
+
+    #[test]
+    fn pid_file_path_matches_paths_module() {
+        assert_eq!(pid_file_path().unwrap(), crate::paths::pid_file().unwrap());
+    }
 }
