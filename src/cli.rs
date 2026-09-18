@@ -55,28 +55,15 @@ pub fn run(args: Cli) -> Result<()> {
 }
 
 fn install() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    return crate::launchd::install();
-    #[cfg(target_os = "windows")]
-    return crate::windows::service::install();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    anyhow::bail!("install is not supported on this platform");
+    crate::launchd::install()
 }
 
 fn uninstall() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    return crate::launchd::uninstall();
-    #[cfg(target_os = "windows")]
-    return crate::windows::service::uninstall();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    anyhow::bail!("uninstall is not supported on this platform");
+    crate::launchd::uninstall()
 }
 
 fn grant() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    return crate::launchd::grant();
-    #[cfg(not(target_os = "macos"))]
-    Ok(()) // no-op: no TCC equivalent on Windows/Linux
+    crate::launchd::grant()
 }
 
 fn status() -> Result<()> {
@@ -86,14 +73,11 @@ fn status() -> Result<()> {
         Ok(cfg) => format!("ok ({} bindings)", cfg.bindings.len()),
         Err(e) => format!("error: {e}"),
     };
-    #[cfg(target_os = "macos")]
-    let ax = if crate::macos::permissions::is_trusted() {
+    let ax = if crate::permissions::is_trusted() {
         "granted"
     } else {
         "denied"
     };
-    #[cfg(not(target_os = "macos"))]
-    let ax = "n/a";
 
     println!(
         "daemon:        {}",
@@ -116,21 +100,7 @@ fn validate(path: Option<PathBuf>) -> Result<()> {
 }
 
 fn default_config() -> &'static str {
-    #[cfg(target_os = "windows")]
-    return r#"[settings]
-# cycle_reset_ms = 1500   # ms of inactivity before window cycle resets
-# hide_previous = false   # minimize previous app's window when switching
-# hold_threshold_ms = 0   # hold hotkey to minimize (0 = disabled)
-
-[bindings]
-# Use the exe stem (without .exe) as the app identifier.
-# "ctrl+1" = "firefox"
-# "ctrl+2" = "Code"
-# "ctrl+3" = "WindowsTerminal"
-# "ctrl+4" = "explorer"
-"#;
-    #[cfg(not(target_os = "windows"))]
-    return r#"[settings]
+    r#"[settings]
 # cycle_reset_ms = 1500   # ms of inactivity before window cycle resets
 # hide_previous = false   # minimize previous app's window when switching
 # hold_threshold_ms = 0   # hold hotkey to minimize (0 = disabled)
@@ -140,7 +110,7 @@ fn default_config() -> &'static str {
 # "ctrl+1" = "com.mitchellh.ghostty"
 # "ctrl+2" = "Google Chrome"
 # "ctrl+3" = { app = "Finder", launch_args = ["--new"] }
-"#;
+"#
 }
 
 fn edit() -> Result<()> {
@@ -174,20 +144,12 @@ fn edit() -> Result<()> {
                 .status()
                 .with_context(|| format!("spawning editor: {cmd}"))?
         }
-        #[cfg(target_os = "macos")]
         None => Command::new("/usr/bin/open")
             .arg("-t")
             .arg("-W")
             .arg(&path)
             .status()
             .context("spawning `open -t`")?,
-        #[cfg(target_os = "windows")]
-        None => Command::new("notepad")
-            .arg(&path)
-            .status()
-            .context("spawning notepad")?,
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        None => anyhow::bail!("no editor found; set $EDITOR"),
     };
     if !status.success() {
         return Err(anyhow!("editor exited with {status}"));

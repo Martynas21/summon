@@ -14,7 +14,7 @@ use core_graphics::event::CGEvent;
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::{CGPoint, CGRect};
 
-use super::{app, window};
+use crate::{app, window};
 
 pub type DisplayId = CGDirectDisplayID;
 

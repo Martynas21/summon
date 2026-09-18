@@ -65,7 +65,7 @@ pub fn find_by_bundle_id_filtered(
     for i in 0..n {
         let app: Retained<NSRunningApplication> = unsafe { arr.objectAtIndex(i) };
         let pid = unsafe { app.processIdentifier() };
-        if crate::macos::proc::cmdline_contains(pid, needle) {
+        if crate::proc::cmdline_contains(pid, needle) {
             return Some(app);
         }
     }
@@ -91,7 +91,7 @@ pub fn find_by_name_filtered(
             None => true,
             Some(needle) => {
                 let pid = unsafe { app.processIdentifier() };
-                crate::macos::proc::cmdline_contains(pid, needle)
+                crate::proc::cmdline_contains(pid, needle)
             }
         }
     })

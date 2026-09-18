@@ -31,8 +31,8 @@ mocking OS APIs tests the mock, not the code.
 - `tui.rs` `run`/`event_loop`/`save_config` — real terminal, real config path
 - `cli.rs` `run` dispatch and `status`/`edit`/`install` — spawn editors, query the daemon
 - `hotkey.rs` `HotkeyRegistry` — wraps `GlobalHotKeyManager`; needs a display server to register
-- `macos/*` — Accessibility API, NSWorkspace, dispatch
-- `windows/*` — Win32 EnumWindows, SetForegroundWindow, etc.
+- `app.rs`, `window.rs`, `screen.rs`, `dispatch.rs`, `proc.rs`, `permissions.rs` —
+  Accessibility API, NSWorkspace, CoreGraphics, libdispatch
 
 ---
 
@@ -143,5 +143,6 @@ cargo test summoner                 # filter by module/test name substring
 cargo test -- --nocapture           # show println! output
 ```
 
-Pinned to Rust **1.95.0** (`rust-toolchain.toml`). Tests compile for the host platform (Linux/WSL)
-even though the app targets macOS and Windows; `#[cfg(target_os = "...")]` gates are active.
+Pinned to Rust **1.95.0** (`rust-toolchain.toml`). The crate is macOS-only — a `compile_error!`
+in `src/lib.rs` guards every other target, so tests build and run natively on macOS with no
+`#[cfg(target_os = "...")]` gates in play.
