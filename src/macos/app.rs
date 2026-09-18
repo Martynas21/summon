@@ -168,9 +168,14 @@ pub fn ensure_visible(app: &NSRunningApplication) {
 }
 
 /// Bring app forward; macOS handles Space-switching per Mission Control settings.
+///
+/// NSApplicationActivateAllWindows (1<<0) is deliberately NOT set: it raises
+/// the app's windows on every display, undoing the active-display scoping the
+/// caller did when picking a window. Default activation surfaces only the
+/// main/key window, which `window::focus` has already pointed at the pick.
 pub fn activate(app: &NSRunningApplication) {
-    // NSApplicationActivateAllWindows (1<<0) | NSApplicationActivateIgnoringOtherApps (1<<1)
-    let opts = NSApplicationActivationOptions(1 | 2);
+    // NSApplicationActivateIgnoringOtherApps (1<<1)
+    let opts = NSApplicationActivationOptions(2);
     unsafe {
         let _ = app.activateWithOptions(opts);
     }

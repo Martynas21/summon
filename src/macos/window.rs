@@ -138,11 +138,11 @@ fn copy_string_attr(el: AXUIElementRef, key: &str) -> Option<String> {
     Some(cf.to_string())
 }
 
-pub fn is_main(window: &WindowEl) -> bool {
-    let attr = cfstr(kAXMainAttribute);
+fn copy_bool_attr(el: AXUIElementRef, key: &str) -> bool {
+    let attr = cfstr(key);
     let mut value: CFTypeRef = ptr::null();
     let err = unsafe {
-        AXUIElementCopyAttributeValue(window.0, attr.as_concrete_TypeRef(), &mut value)
+        AXUIElementCopyAttributeValue(el, attr.as_concrete_TypeRef(), &mut value)
     };
     if err != kAXErrorSuccess || value.is_null() {
         return false;
@@ -150,41 +150,48 @@ pub fn is_main(window: &WindowEl) -> bool {
     let result = unsafe { CFBooleanGetValue(value as _) };
     unsafe { CFRelease(value) };
     result
+}
+
+pub fn is_main(window: &WindowEl) -> bool {
+    copy_bool_attr(window.0, kAXMainAttribute)
 }
 
 pub fn is_minimized(window: &WindowEl) -> bool {
-    let attr = cfstr(kAXMinimizedAttribute);
-    let mut value: CFTypeRef = ptr::null();
-    let err = unsafe {
-        AXUIElementCopyAttributeValue(window.0, attr.as_concrete_TypeRef(), &mut value)
-    };
-    if err != kAXErrorSuccess || value.is_null() {
-        return false;
-    }
-    let result = unsafe { CFBooleanGetValue(value as _) };
-    unsafe { CFRelease(value) };
-    result
+    copy_bool_attr(window.0, kAXMinimizedAttribute)
 }
 
-pub fn unminimize(window: &WindowEl) {
-    let attr = cfstr(kAXMinimizedAttribute);
-    unsafe {
-        let _ = AXUIElementSetAttributeValue(
-            window.0,
-            attr.as_concrete_TypeRef(),
-            kCFBooleanFalse as _,
-        );
-    }
+/// Native fullscreen — the window occupies its own Space. Such windows are
+/// absent from `kAXWindowsAttribute` while another Space is active, and
+/// macOS rejects `kAXMinimizedAttribute` on them.
+///
+/// "AXFullScreen" has no `accessibility_sys` constant; it is the same
+/// private-but-stable string AltTab, yabai and Hammerspoon read.
+pub fn is_fullscreen(window: &WindowEl) -> bool {
+    copy_bool_attr(window.0, AX_FULLSCREEN_ATTRIBUTE)
 }
 
-pub fn minimize(window: &WindowEl) {
+const AX_FULLSCREEN_ATTRIBUTE: &str = "AXFullScreen";
+
+/// Returns the AX error code (0 = success) — callers log it, because macOS
+/// rejects minimize on fullscreen windows and silently ignoring that made
+/// the daemon claim minimizes it never performed.
+pub fn unminimize(window: &WindowEl) -> AXError {
+    set_minimized(window, false)
+}
+
+pub fn minimize(window: &WindowEl) -> AXError {
+    set_minimized(window, true)
+}
+
+fn set_minimized(window: &WindowEl, minimized: bool) -> AXError {
     let attr = cfstr(kAXMinimizedAttribute);
     unsafe {
-        let _ = AXUIElementSetAttributeValue(
-            window.0,
-            attr.as_concrete_TypeRef(),
-            kCFBooleanTrue as _,
-        );
+        let value: CFTypeRef = if minimized {
+            kCFBooleanTrue as _
+        } else {
+            kCFBooleanFalse as _
+        };
+        AXUIElementSetAttributeValue(window.0, attr.as_concrete_TypeRef(), value)
     }
 }
 
@@ -204,11 +211,11 @@ pub fn set_app_hidden(app: &AppEl, hidden: bool) -> AXError {
     }
 }
 
-pub fn raise(window: &WindowEl) {
+/// Raise within the app's window stack. On a window whose Space is not the
+/// active one this is what triggers the Space switch.
+pub fn raise(window: &WindowEl) -> AXError {
     let action = cfstr(kAXRaiseAction);
-    unsafe {
-        let _ = AXUIElementPerformAction(window.0, action.as_concrete_TypeRef());
-    }
+    unsafe { AXUIElementPerformAction(window.0, action.as_concrete_TypeRef()) }
 }
 
 pub fn title(window: &WindowEl) -> Option<String> {
@@ -287,20 +294,22 @@ fn copy_ax_size(el: AXUIElementRef, key: &str) -> Option<CGSize> {
 /// Mark window as the app's main+focused window. Required when the app is
 /// already foreground — AXRaise on its own doesn't change which window
 /// the OS treats as the app's main one, so focus snaps back.
-pub fn focus(window: &WindowEl) {
+/// Returns the (main, focused) AX error codes.
+pub fn focus(window: &WindowEl) -> (AXError, AXError) {
     unsafe {
         let main = cfstr(kAXMainAttribute);
-        let _ = AXUIElementSetAttributeValue(
+        let main_err = AXUIElementSetAttributeValue(
             window.0,
             main.as_concrete_TypeRef(),
             kCFBooleanTrue as _,
         );
         let focused = cfstr(kAXFocusedAttribute);
-        let _ = AXUIElementSetAttributeValue(
+        let focused_err = AXUIElementSetAttributeValue(
             window.0,
             focused.as_concrete_TypeRef(),
             kCFBooleanTrue as _,
         );
+        (main_err, focused_err)
     }
 }
 

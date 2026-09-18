@@ -107,6 +107,7 @@ macOS only:
 
 - **Window identity = CGWindowID, not `AXUIElementRef`.** AX pointers are not stable across queries. `_AXUIElementGetWindow` is a private-but-stable symbol; see `src/macos/window.rs`.
 - **Use AX `kAXMinimizedAttribute`, not `NSRunningApplication.hide()`.** `hide()` returns NO during app activation/transition (Chrome, Edge, VSCode, Slack all rejected it in practice).
+- **Never pass `NSApplicationActivateAllWindows` to `activateWithOptions`.** It raises the app's windows on *every* display, undoing the active-display scoping `pick_window_idx` just did — a multi-monitor summon would pop the app on both screens. Default activation surfaces only main/key, which `window::focus` has already set to the picked window.
 
 Windows only:
 
@@ -115,11 +116,14 @@ Windows only:
 
 ## Hold-to-minimize state machine
 
-Active iff `settings.hold_threshold_ms > 0`. Press starts a timer; release before it fires → summon; timer fires first → minimize frontmost (no focus change, no cycle-state mutation).
+Active iff `settings.hold_threshold_ms > 0`. Press starts a timer; release before it fires → summon; timer fires first → `Summoner::minimize_on_active_display` (no focus change, no cycle-state mutation).
 
-- `State.pending_holds: HashMap<u32, ()>` tracks hotkey ids in their press→(release|timer) window. Whichever of `on_hotkey_release_main` / `on_hold_fire` runs first removes the entry; the loser no-ops.
+- `State.pending_holds: HashMap<u32, u32>` maps hotkey id → the `hold_seq` of the press that opened the press→(release|timer) window. Whichever of `on_hotkey_release_main` / `on_hold_fire` runs first removes the entry; the loser no-ops.
+- **The seq tag is load-bearing, not bookkeeping.** `dispatch_after` cannot be cancelled on macOS, so press N's timer stays in flight after release. Keyed on the id alone it would consume press N+1's entry and minimize when the user meant to summon — the "have to press it twice" bug. `on_hold_fire` therefore acts only when the stored seq equals the one packed into its context. Windows derives its `SetTimer` id from the same context, so `cancel_timer` must be passed the packed value too.
+- The id and seq share one context pointer via `pack_hold_ctx` / `unpack_hold_ctx` (id in the low 32 bits), keeping the timer path allocation-free.
 - OS key-repeat: a second `Pressed` while the entry exists is ignored (no second timer scheduled).
 - On reload, `pending_holds.clear()` — hotkey ids are reassigned by `global-hotkey` at register time.
+- **Minimize is scoped to the active display.** A hold never reaches a window the user can't see: `pick_minimize_idx` takes the frontmost non-minimized window on `screen::active_display()`, and no-ops when that display's window is already minimized or the app isn't there. Enumeration order spans every monitor, so the positional front window is often on another one.
 
 ## Signals & control plane
 

@@ -17,11 +17,16 @@ struct State {
     summoner: Summoner,
     registry: HotkeyRegistry,
     cfg_path: PathBuf,
-    /// Hotkey ids currently in their Press→(Release|threshold) window. Empty
-    /// when hold-to-minimize is disabled. Entries are removed by whichever
-    /// of the release handler or the threshold timer wins; the other branch
-    /// then no-ops.
-    pending_holds: std::collections::HashMap<u32, ()>,
+    /// Hotkey ids currently in their Press→(Release|threshold) window, each
+    /// tagged with the sequence number of the press that opened it. Empty when
+    /// hold-to-minimize is disabled. Entries are removed by whichever of the
+    /// release handler or the threshold timer wins; the other branch no-ops.
+    pending_holds: std::collections::HashMap<u32, u32>,
+    /// Monotonic press counter. `dispatch_after` can't be cancelled, so a
+    /// timer from an earlier press stays in flight and would otherwise consume
+    /// a later press's entry — minimizing when the user meant to summon.
+    /// The seq lets that stale timer recognise itself and no-op.
+    hold_seq: u32,
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -40,6 +45,22 @@ fn lock_state() -> Option<std::sync::MutexGuard<'static, State>> {
         }
     };
     Some(guard)
+}
+
+/// Pack a hotkey id and press sequence number into the single context
+/// pointer the dispatch/timer plumbing carries (64-bit on both platforms), so
+/// hold timers stay allocation-free while still identifying which press
+/// scheduled them.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn pack_hold_ctx(id: u32, seq: u32) -> *mut std::ffi::c_void {
+    (((seq as u64) << 32) | id as u64) as usize as *mut std::ffi::c_void
+}
+
+/// Inverse of [`pack_hold_ctx`], returning `(id, seq)`.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn unpack_hold_ctx(ctx: *mut std::ffi::c_void) -> (u32, u32) {
+    let v = ctx as usize as u64;
+    (v as u32, (v >> 32) as u32)
 }
 
 /// Owned copies of the binding fields, so the registry borrow ends before
@@ -105,6 +126,7 @@ pub fn run() -> Result<()> {
                 registry,
                 cfg_path,
                 pending_holds: std::collections::HashMap::new(),
+                hold_seq: 0,
             }))
             .ok()
             .expect("STATE initialized twice");
@@ -141,6 +163,7 @@ pub fn run() -> Result<()> {
                 registry,
                 cfg_path,
                 pending_holds: std::collections::HashMap::new(),
+                hold_seq: 0,
                 reload_event,
                 stop_event,
             }))
@@ -268,10 +291,13 @@ extern "C" fn on_hotkey_press_main(ctx: *mut std::ffi::c_void) {
                 // ignore the duplicate so we don't reschedule a second timer.
                 return;
             }
-            state.pending_holds.insert(id, ());
-            info!(ident, id, threshold_ms = d.as_millis() as u64, "hotkey press (pending)");
+            let seq = state.hold_seq.wrapping_add(1);
+            state.hold_seq = seq;
+            state.pending_holds.insert(id, seq);
+            info!(ident, id, seq, threshold_ms = d.as_millis() as u64, "hotkey press (pending)");
             drop(state);
-            unsafe { dispatch::after_main_ms(d.as_millis() as u64, ctx, on_hold_fire) };
+            let hold_ctx = pack_hold_ctx(id, seq);
+            unsafe { dispatch::after_main_ms(d.as_millis() as u64, hold_ctx, on_hold_fire) };
         }
     }
 }
@@ -282,22 +308,23 @@ extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
     let Some(mut state) = lock_state() else {
         return;
     };
-    if state.pending_holds.remove(&id).is_none() {
+    let Some(seq) = state.pending_holds.remove(&id) else {
         // Timer already fired (or hold disabled — release wasn't tracked).
         return;
-    }
-    // Cancel the SetTimer so on_hold_fire never fires. macOS has no
-    // equivalent — dispatch_after can't be cancelled; its hold-fire no-ops
-    // on the already-cleared pending entry instead.
+    };
+    // Cancel the SetTimer so on_hold_fire never fires. The timer id is derived
+    // from the context, so it must be the same packed value the press used.
+    // macOS has no equivalent — dispatch_after can't be cancelled; its
+    // hold-fire recognises the cleared/re-tagged entry and no-ops instead.
     #[cfg(target_os = "windows")]
     unsafe {
-        dispatch::cancel_timer(ctx)
+        dispatch::cancel_timer(pack_hold_ctx(id, seq))
     };
     let Some((ident, filter)) = binding_for(&state, id) else {
         warn!(id, "unmapped hotkey release");
         return;
     };
-    info!(ident, id, "hotkey released → summon");
+    info!(ident, id, seq, "hotkey released → summon");
     if let Err(e) = state.summoner.summon(&ident, filter.as_deref()) {
         warn!(ident, "summon failed: {e:#}");
     }
@@ -305,22 +332,28 @@ extern "C" fn on_hotkey_release_main(ctx: *mut std::ffi::c_void) {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 extern "C" fn on_hold_fire(ctx: *mut std::ffi::c_void) {
-    let id = ctx as usize as u32;
+    let (id, seq) = unpack_hold_ctx(ctx);
     let Some(mut state) = lock_state() else {
         return;
     };
-    if state.pending_holds.remove(&id).is_none() {
-        // Released before threshold (handled by release path) — or reload
-        // cleared the map. Either way, no-op.
+    // Only the press that scheduled this timer may act on it. A mismatch means
+    // that press was released (or reload cleared the map) and a later press
+    // opened the current window — minimizing then would swallow the summon the
+    // user asked for.
+    if state.pending_holds.get(&id) != Some(&seq) {
         return;
     }
+    state.pending_holds.remove(&id);
     let Some((ident, filter)) = binding_for(&state, id) else {
         warn!(id, "hold fired for unmapped id");
         return;
     };
-    info!(ident, id, "hold threshold elapsed → minimize");
-    if let Err(e) = state.summoner.minimize_frontmost(&ident, filter.as_deref()) {
-        warn!(ident, "minimize_frontmost failed: {e:#}");
+    info!(ident, id, seq, "hold threshold elapsed → minimize");
+    if let Err(e) = state
+        .summoner
+        .minimize_on_active_display(&ident, filter.as_deref())
+    {
+        warn!(ident, "minimize_on_active_display failed: {e:#}");
     }
 }
 
@@ -389,7 +422,8 @@ struct State {
     summoner: Summoner,
     registry: HotkeyRegistry,
     cfg_path: PathBuf,
-    pending_holds: std::collections::HashMap<u32, ()>,
+    pending_holds: std::collections::HashMap<u32, u32>,
+    hold_seq: u32,
     reload_event: usize, // HANDLE stored as usize (Send-safe)
     stop_event: usize,
 }
@@ -480,5 +514,43 @@ fn spawn_ipc_watcher_thread(reload_event: usize, stop_event: usize) {
             }
         })
         .expect("spawning IPC watcher thread");
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hold_ctx_round_trips_id_and_seq() {
+        let (id, seq) = unpack_hold_ctx(pack_hold_ctx(524294, 7));
+        assert_eq!(id, 524294);
+        assert_eq!(seq, 7);
+    }
+
+    #[test]
+    fn hold_ctx_round_trips_zero_seq() {
+        let (id, seq) = unpack_hold_ctx(pack_hold_ctx(524294, 0));
+        assert_eq!(id, 524294);
+        assert_eq!(seq, 0);
+    }
+
+    #[test]
+    fn hold_ctx_keeps_max_id_out_of_the_seq_half() {
+        let (id, seq) = unpack_hold_ctx(pack_hold_ctx(u32::MAX, 1));
+        assert_eq!(id, u32::MAX);
+        assert_eq!(seq, 1);
+    }
+
+    #[test]
+    fn hold_ctx_keeps_max_seq_out_of_the_id_half() {
+        let (id, seq) = unpack_hold_ctx(pack_hold_ctx(1, u32::MAX));
+        assert_eq!(id, 1);
+        assert_eq!(seq, u32::MAX);
+    }
+
+    #[test]
+    fn hold_ctx_differs_per_press_for_the_same_hotkey() {
+        assert_ne!(pack_hold_ctx(524294, 1), pack_hold_ctx(524294, 2));
+    }
 }
 

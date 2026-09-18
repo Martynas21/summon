@@ -450,11 +450,17 @@ impl Summoner {
         anyhow::bail!("summon is not supported on this platform");
     }
 
-    /// Minimize the frontmost window of `ident`'s app. No focus change, no
-    /// activation, no cycle-state mutation. No-op if the app isn't running,
-    /// has no enumerable windows, or its front window is already minimized.
+    /// Minimize `ident`'s frontmost window **on the display the user is
+    /// working on**. No focus change, no activation, no cycle-state mutation.
+    /// No-op if the app isn't running, has no enumerable windows, or has
+    /// nothing visible on the active display — a hold must never reach across
+    /// to a window the user can't see.
     #[cfg(target_os = "macos")]
-    pub fn minimize_frontmost(&mut self, ident: &str, cmdline_filter: Option<&str>) -> Result<()> {
+    pub fn minimize_on_active_display(
+        &mut self,
+        ident: &str,
+        cmdline_filter: Option<&str>,
+    ) -> Result<()> {
         let running = match app::find_running_filtered(ident, cmdline_filter) {
             Some(a) => a,
             None => {
@@ -471,24 +477,35 @@ impl Summoner {
             }
         };
         let wins = window::windows(&app_el);
-        let front = match wins.first() {
-            Some(w) => w,
-            None => {
-                info!(ident, "minimize: no enumerable windows");
-                return Ok(());
-            }
-        };
-        if window::is_minimized(front) {
-            info!(ident, "minimize: front already minimized");
+        if wins.is_empty() {
+            info!(ident, "minimize: no enumerable windows");
             return Ok(());
         }
-        window::minimize(front);
-        info!(ident, pid, total = wins.len(), "minimized frontmost");
+        let active = screen::active_display();
+        let pick = pick_minimize_idx(
+            &wins,
+            |w| window::is_minimized(w),
+            |w| screen::window_display(w) == Some(active),
+        );
+        let Some(idx) = pick else {
+            info!(
+                ident,
+                total = wins.len(),
+                "minimize: nothing visible on active display"
+            );
+            return Ok(());
+        };
+        window::minimize(&wins[idx]);
+        info!(ident, pid, idx, total = wins.len(), "minimized frontmost on active display");
         Ok(())
     }
 
     #[cfg(target_os = "windows")]
-    pub fn minimize_frontmost(&mut self, ident: &str, cmdline_filter: Option<&str>) -> Result<()> {
+    pub fn minimize_on_active_display(
+        &mut self,
+        ident: &str,
+        cmdline_filter: Option<&str>,
+    ) -> Result<()> {
         let running = match app::find_running_filtered(ident, cmdline_filter) {
             Some(a) => a,
             None => {
@@ -497,34 +514,43 @@ impl Summoner {
             }
         };
         let pid = app::pid(&running);
-        // Prefer the actual foreground window if it belongs to this app.
-        // Fall back to the first non-minimized window from EnumWindows.
-        // EnumWindows order is unspecified, so wins.first() may be a minimized
-        // window even when the visible frontmost window is not.
-        let front = window::focused_window_for_pid(pid).or_else(|| {
-            window::windows_for_pid(pid)
-                .into_iter()
-                .find(|w| !window::is_minimized(w))
-        });
-        let front = match front {
-            Some(w) => w,
-            None => {
-                info!(ident, "minimize: no enumerable windows");
-                return Ok(());
-            }
-        };
-        if window::is_minimized(&front) {
-            info!(ident, "minimize: front already minimized");
+        let wins = window::windows_for_pid(pid);
+        if wins.is_empty() {
+            info!(ident, "minimize: no enumerable windows");
             return Ok(());
         }
-        window::minimize(&front);
-        info!(ident, pid, "minimized frontmost");
+        let active = screen::active_display();
+        let on_active = |w: &window::WindowHandle| screen::window_display(w) == Some(active);
+        // Prefer the real foreground window when it belongs to this app and
+        // sits on the active display. EnumWindows order is unspecified, so the
+        // positional pick below is only a best guess at "frontmost".
+        let focused = window::focused_window_for_pid(pid)
+            .filter(|w| !window::is_minimized(w) && on_active(w));
+        if let Some(w) = focused {
+            window::minimize(&w);
+            info!(ident, pid, "minimized focused window on active display");
+            return Ok(());
+        }
+        let Some(idx) = pick_minimize_idx(&wins, |w| window::is_minimized(w), &on_active) else {
+            info!(
+                ident,
+                total = wins.len(),
+                "minimize: nothing visible on active display"
+            );
+            return Ok(());
+        };
+        window::minimize(&wins[idx]);
+        info!(ident, pid, idx, total = wins.len(), "minimized frontmost on active display");
         Ok(())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    pub fn minimize_frontmost(&mut self, _ident: &str, _cmdline_filter: Option<&str>) -> Result<()> {
-        anyhow::bail!("minimize_frontmost is not supported on this platform");
+    pub fn minimize_on_active_display(
+        &mut self,
+        _ident: &str,
+        _cmdline_filter: Option<&str>,
+    ) -> Result<()> {
+        anyhow::bail!("minimize_on_active_display is not supported on this platform");
     }
 }
 
@@ -573,6 +599,22 @@ fn pick_window_idx<W>(
         .or(last_idx)
         .or(any_visible_idx)
         .unwrap_or(0)
+}
+
+/// Frontmost non-minimized window on the active display, or None when the app
+/// has nothing visible there.
+///
+/// Hold-to-minimize uses this instead of "window 0": enumeration order spans
+/// every display, so the positional front window is often on another monitor.
+/// None means "do nothing" — either this display's window is already minimized
+/// or the app isn't here at all, and in both cases the user sees no change.
+fn pick_minimize_idx<W>(
+    wins: &[W],
+    is_minimized: impl Fn(&W) -> bool,
+    on_active_display: impl Fn(&W) -> bool,
+) -> Option<usize> {
+    wins.iter()
+        .position(|w| !is_minimized(w) && on_active_display(w))
 }
 
 fn cursor_key(bundle_id: &str, name: &str) -> String {
@@ -708,6 +750,42 @@ mod tests {
         assert_eq!(pick(&wins, None, false), 0);
     }
 
+    // --- pick_minimize_idx ---
+
+    /// Same (is_minimized, on_active_display) modelling as `pick`.
+    fn pick_min(wins: &[(bool, bool)]) -> Option<usize> {
+        pick_minimize_idx(wins, |w| w.0, |w| w.1)
+    }
+
+    #[test]
+    fn minimize_picks_first_visible_window_on_active_display() {
+        let wins = [(true, true), (false, true), (false, true)];
+        assert_eq!(pick_min(&wins), Some(1));
+    }
+
+    #[test]
+    fn minimize_skips_visible_windows_on_other_displays() {
+        let wins = [(false, false), (false, true)];
+        assert_eq!(pick_min(&wins), Some(1));
+    }
+
+    #[test]
+    fn minimize_does_nothing_when_active_display_window_already_minimized() {
+        let wins = [(true, true)];
+        assert_eq!(pick_min(&wins), None);
+    }
+
+    #[test]
+    fn minimize_does_nothing_when_app_is_only_on_another_display() {
+        let wins = [(false, false), (true, false)];
+        assert_eq!(pick_min(&wins), None);
+    }
+
+    #[test]
+    fn minimize_does_nothing_without_windows() {
+        assert_eq!(pick_min(&[]), None);
+    }
+
     // --- unsupported-platform stubs ---
 
     #[test]
@@ -720,9 +798,12 @@ mod tests {
 
     #[test]
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    fn minimize_frontmost_errors_on_unsupported_platform() {
+    fn minimize_on_active_display_errors_on_unsupported_platform() {
         let mut s = Summoner::new(&cfg_with(Settings::default()));
-        let err = s.minimize_frontmost("foo", None).unwrap_err().to_string();
+        let err = s
+            .minimize_on_active_display("foo", None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not supported"), "got: {err}");
     }
 
