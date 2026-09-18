@@ -11,7 +11,6 @@ const GRANT_PROMPTED_PATH: &str = "/tmp/summon-grant.prompted";
 pub fn install() -> Result<()> {
     let binary = std::env::current_exe().context("locating current executable")?;
 
-    #[cfg(target_os = "macos")]
     {
         prompt_for_grant_via_launchd(&binary).map_err(|e| {
             anyhow!(
@@ -57,20 +56,17 @@ pub fn install() -> Result<()> {
 pub fn grant() -> Result<()> {
     let _ = std::fs::remove_file(GRANT_STATUS_PATH);
 
-    #[cfg(target_os = "macos")]
     let trusted = {
-        let trusted_now = crate::macos::permissions::is_trusted();
+        let trusted_now = crate::permissions::is_trusted();
         // Fire the modal exactly once across the install's polling loop.
         // The sentinel prevents subsequent helper invocations from
         // re-popping it after the user has dismissed but before they grant.
         if !trusted_now && !std::path::Path::new(GRANT_PROMPTED_PATH).exists() {
-            let _ = crate::macos::permissions::request_trust();
+            let _ = crate::permissions::request_trust();
             let _ = std::fs::write(GRANT_PROMPTED_PATH, "");
         }
         trusted_now
     };
-    #[cfg(not(target_os = "macos"))]
-    let trusted = true;
 
     let outcome = if trusted { "ok" } else { "fail" };
     std::fs::write(GRANT_STATUS_PATH, outcome)
@@ -81,7 +77,6 @@ pub fn grant() -> Result<()> {
 /// Loop bootstrapping the `_grant` helper until it reports trusted, or we
 /// time out. Each iteration is a fresh launchd-spawned process so TCC's
 /// per-process trust cache doesn't mask grants made mid-loop.
-#[cfg(target_os = "macos")]
 fn prompt_for_grant_via_launchd(binary: &Path) -> Result<()> {
     let _ = std::fs::remove_file(GRANT_STATUS_PATH);
     let _ = std::fs::remove_file(GRANT_PROMPTED_PATH);
@@ -129,7 +124,6 @@ fn prompt_for_grant_via_launchd(binary: &Path) -> Result<()> {
 
 /// Bootstrap a one-shot `_grant` helper, wait for it to write its status
 /// file (typically <1s), then bootout. Returns the helper's outcome.
-#[cfg(target_os = "macos")]
 fn run_grant_helper(plist_path: &Path) -> Result<String> {
     let _ = std::fs::remove_file(GRANT_STATUS_PATH);
     let _ = bootout(plist_path);
@@ -150,7 +144,6 @@ fn run_grant_helper(plist_path: &Path) -> Result<String> {
     outcome.ok_or_else(|| anyhow!("helper produced no status"))
 }
 
-#[cfg(target_os = "macos")]
 fn render_grant_plist(label: &str, binary: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>

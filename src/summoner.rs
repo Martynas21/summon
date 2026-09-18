@@ -1,8 +1,5 @@
 use crate::config::ParsedConfig;
-#[cfg(target_os = "macos")]
-use crate::macos::{app, screen, window};
-#[cfg(target_os = "windows")]
-use crate::windows::{app, screen, window};
+use crate::{app, screen, window};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -55,7 +52,6 @@ impl Summoner {
         self.hold_threshold
     }
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn cursor_entry(&mut self, key: String, now: Instant) -> &mut AppCursor {
         self.cursors.entry(key).or_insert(AppCursor {
             last_window: None,
@@ -63,7 +59,6 @@ impl Summoner {
         })
     }
 
-    #[cfg(target_os = "macos")]
     pub fn summon(&mut self, ident: &str, cmdline_filter: Option<&str>) -> Result<()> {
         let running = match app::find_running_filtered(ident, cmdline_filter) {
             Some(a) => a,
@@ -284,178 +279,11 @@ impl Summoner {
         Ok(())
     }
 
-    #[cfg(target_os = "windows")]
-    pub fn summon(&mut self, ident: &str, cmdline_filter: Option<&str>) -> Result<()> {
-        let running = match app::find_running_filtered(ident, cmdline_filter) {
-            Some(a) => a,
-            None => {
-                if cmdline_filter.is_some() {
-                    info!(ident, filter = ?cmdline_filter, "no PID matched cmdline filter; launching anyway");
-                } else {
-                    info!(ident, "launching (fire-and-forget)");
-                }
-                app::launch(ident).with_context(|| format!("launching {ident}"))?;
-                return Ok(());
-            }
-        };
-        let pid = app::pid(&running);
-        let resolved_name = app::name(&running).unwrap_or_default();
-        let frontmost_pid = app::frontmost_pid().unwrap_or(0);
-        let was_active = frontmost_pid == pid;
-        info!(ident, pid, name = %resolved_name, was_active, frontmost_pid, "resolved app");
-
-        app::ensure_visible(&running);
-
-        let wins = window::windows_for_pid(pid);
-        // Fallback for apps that hide to the system tray via SW_HIDE (e.g.
-        // Discord). Their main window is invisible but still enumerable; raise
-        // calls SW_SHOW so it restores correctly.
-        let wins = if wins.is_empty() {
-            window::tray_windows_for_pid(pid)
-        } else {
-            wins
-        };
-        if wins.is_empty() {
-            warn!(ident, "no enumerable windows; activate only");
-            app::activate(&running);
-            return Ok(());
-        }
-
-        let now = Instant::now();
-        let cycle_window = self.cycle_window;
-
-        let is_rapid = matches!(
-            &self.last_press,
-            Some((prev_ident, prev_time))
-                if prev_ident == ident && now.duration_since(*prev_time) <= cycle_window
-        );
-
-        // Windows has no bundle IDs; key on exe name.
-        let key = cursor_key("", &resolved_name);
-        let cursor_last = self.cursors.get(&key).and_then(|c| c.last_window);
-        let last_idx = cursor_last
-            .and_then(|id| wins.iter().position(|w| window::window_id(w) == Some(id)));
-
-        let active = screen::active_display();
-        let idx = pick_window_idx(
-            &wins,
-            last_idx,
-            is_rapid,
-            |w| window::is_minimized(w),
-            |w| screen::window_display(w) == Some(active),
-        );
-
-        let pick = &wins[idx];
-        let was_minimized = window::is_minimized(pick);
-        let target_display = screen::window_display(pick);
-
-        if is_rapid
-            && self.hide_previous
-            && wins.len() > 1
-            && last_idx.is_some()
-            && last_idx != Some(idx)
-        {
-            let prev_win = &wins[last_idx.unwrap()];
-            if !window::is_minimized(prev_win) {
-                window::minimize(prev_win);
-            }
-        }
-
-        if was_minimized
-            && !was_active
-            && self.hide_previous
-            && frontmost_pid > 0
-            && frontmost_pid != pid
-        {
-            let prev_running = app::for_pid(frontmost_pid);
-            let prev_name = prev_running
-                .as_ref()
-                .and_then(|a| app::name(a))
-                .unwrap_or_default();
-            if app::is_persistent_shell("", &prev_name) {
-                info!(prev_pid = frontmost_pid, "skip minimize: persistent shell");
-            } else if target_display.is_none() {
-                warn!(prev_pid = frontmost_pid, "skip minimize: target display unknown");
-            } else {
-                let prev_wins = window::windows_for_pid(frontmost_pid);
-                let target_disp = target_display.unwrap();
-                let user_active = prev_wins
-                    .iter()
-                    .find(|w| {
-                        !window::is_minimized(w)
-                            && screen::window_display(w) == Some(target_disp)
-                    })
-                    .and_then(|w| window::window_id(w));
-                let mut minimized = 0usize;
-                for w in &prev_wins {
-                    if window::is_minimized(w) {
-                        continue;
-                    }
-                    if screen::window_display(w) != Some(target_disp) {
-                        continue;
-                    }
-                    window::minimize(w);
-                    minimized += 1;
-                }
-                if let Some(id) = user_active {
-                    let prev_key = cursor_key("", &prev_name);
-                    self.cursor_entry(prev_key, now).last_window = Some(id);
-                }
-                info!(
-                    prev_pid = frontmost_pid,
-                    name = %prev_name,
-                    total = prev_wins.len(),
-                    minimized,
-                    target_display = target_disp,
-                    user_active = ?user_active,
-                    "minimized previous (target-display scope)"
-                );
-            }
-        }
-
-        if was_minimized {
-            window::unminimize(pick);
-        }
-        window::focus(pick);
-        window::raise(pick);
-        if !was_active {
-            app::activate(&running);
-        }
-
-        let cursor = self.cursor_entry(key, now);
-        cursor.last_window = window::window_id(pick);
-        cursor.last_press = now;
-        self.last_press = Some((ident.to_string(), now));
-
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let picked_title = window::title(pick).unwrap_or_default();
-            tracing::debug!(ident, picked = %picked_title, "picked window");
-        }
-        info!(
-            ident,
-            idx,
-            total = wins.len(),
-            was_active,
-            is_rapid,
-            was_minimized,
-            target_display = ?target_display,
-            had_last = last_idx.is_some(),
-            "summoned"
-        );
-        Ok(())
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    pub fn summon(&mut self, _ident: &str, _cmdline_filter: Option<&str>) -> Result<()> {
-        anyhow::bail!("summon is not supported on this platform");
-    }
-
     /// Minimize `ident`'s frontmost window **on the display the user is
     /// working on**. No focus change, no activation, no cycle-state mutation.
     /// No-op if the app isn't running, has no enumerable windows, or has
     /// nothing visible on the active display — a hold must never reach across
     /// to a window the user can't see.
-    #[cfg(target_os = "macos")]
     pub fn minimize_on_active_display(
         &mut self,
         ident: &str,
@@ -500,58 +328,7 @@ impl Summoner {
         Ok(())
     }
 
-    #[cfg(target_os = "windows")]
-    pub fn minimize_on_active_display(
-        &mut self,
-        ident: &str,
-        cmdline_filter: Option<&str>,
-    ) -> Result<()> {
-        let running = match app::find_running_filtered(ident, cmdline_filter) {
-            Some(a) => a,
-            None => {
-                info!(ident, "minimize: app not running");
-                return Ok(());
-            }
-        };
-        let pid = app::pid(&running);
-        let wins = window::windows_for_pid(pid);
-        if wins.is_empty() {
-            info!(ident, "minimize: no enumerable windows");
-            return Ok(());
-        }
-        let active = screen::active_display();
-        let on_active = |w: &window::WindowHandle| screen::window_display(w) == Some(active);
-        // Prefer the real foreground window when it belongs to this app and
-        // sits on the active display. EnumWindows order is unspecified, so the
-        // positional pick below is only a best guess at "frontmost".
-        let focused = window::focused_window_for_pid(pid)
-            .filter(|w| !window::is_minimized(w) && on_active(w));
-        if let Some(w) = focused {
-            window::minimize(&w);
-            info!(ident, pid, "minimized focused window on active display");
-            return Ok(());
-        }
-        let Some(idx) = pick_minimize_idx(&wins, |w| window::is_minimized(w), &on_active) else {
-            info!(
-                ident,
-                total = wins.len(),
-                "minimize: nothing visible on active display"
-            );
-            return Ok(());
-        };
-        window::minimize(&wins[idx]);
-        info!(ident, pid, idx, total = wins.len(), "minimized frontmost on active display");
-        Ok(())
-    }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    pub fn minimize_on_active_display(
-        &mut self,
-        _ident: &str,
-        _cmdline_filter: Option<&str>,
-    ) -> Result<()> {
-        anyhow::bail!("minimize_on_active_display is not supported on this platform");
-    }
 }
 
 /// Pick which window to raise/focus.
@@ -784,27 +561,6 @@ mod tests {
     #[test]
     fn minimize_does_nothing_without_windows() {
         assert_eq!(pick_min(&[]), None);
-    }
-
-    // --- unsupported-platform stubs ---
-
-    #[test]
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    fn summon_errors_on_unsupported_platform() {
-        let mut s = Summoner::new(&cfg_with(Settings::default()));
-        let err = s.summon("foo", None).unwrap_err().to_string();
-        assert!(err.contains("not supported"), "got: {err}");
-    }
-
-    #[test]
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    fn minimize_on_active_display_errors_on_unsupported_platform() {
-        let mut s = Summoner::new(&cfg_with(Settings::default()));
-        let err = s
-            .minimize_on_active_display("foo", None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not supported"), "got: {err}");
     }
 
     // --- Summoner::new ---

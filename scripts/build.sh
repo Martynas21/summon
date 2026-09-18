@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if [[ "$(uname)" != "Darwin" ]]; then
-    echo "build.sh is macOS-only (codesign step). On Windows, use: cargo build --release" >&2
+    echo "build.sh is macOS-only (codesign step); so is summon itself." >&2
     exit 1
 fi
 

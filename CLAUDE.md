@@ -4,18 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`summon` is a single-binary daemon for macOS and Windows that binds hotkeys to apps. Press → app pops to foreground (launching if needed, un-hiding/un-minimizing/Space-switching as required). Repeat presses cycle through that app's windows. Holding the hotkey (when `hold_threshold_ms > 0`) minimizes the app's frontmost window.
+`summon` is a single-binary daemon for macOS that binds hotkeys to apps. Press → app pops to foreground (launching if needed, un-hiding/un-minimizing/Space-switching as required). Repeat presses cycle through that app's windows. Holding the hotkey (when `hold_threshold_ms > 0`) minimizes the app's frontmost window.
 
-Supports macOS and Windows. Pinned to Rust **1.95.0** (`rust-toolchain.toml`), edition 2024.
+macOS only. Pinned to Rust **1.95.0** (`rust-toolchain.toml`), edition 2024.
 
 ## Key documents
 
-- [docs/deploy-macos.md](docs/deploy-macos.md) — macOS install, TCC grant flow, `scripts/build.sh` rationale, deploying code changes
-- [docs/deploy-windows.md](docs/deploy-windows.md) — WSL cross-compile setup, `cargo-xwin`, copy workflow, Task Scheduler, editor config
+- [docs/deploy-macos.md](docs/deploy-macos.md) — install, TCC grant flow, `scripts/build.sh` rationale, deploying code changes
 
 ## Build / run / test
-
-### macOS
 
 ```bash
 cargo build                         # debug build (fine for tests; don't use for `summon run`)
@@ -35,22 +32,9 @@ RUST_LOG=debug cargo run -- run     # foreground daemon
 
 See [docs/deploy-macos.md](docs/deploy-macos.md) for install, TCC, and code-change workflows.
 
-### Windows (cross-compile from WSL)
-
-```bash
-source "$HOME/.cargo/env"
-cargo xwin build --release --target x86_64-pc-windows-msvc
-# → target/x86_64-pc-windows-msvc/release/summon.exe
-cp target/x86_64-pc-windows-msvc/release/summon.exe /mnt/c/Users/<username>/
-```
-
-See [docs/deploy-windows.md](docs/deploy-windows.md) for one-time setup, install, and code-change workflows.
-
 ## Architecture — request flow
 
 The daemon is a single-process, single-main-thread app. Every hotkey/signal handler runs serialised on the main queue/pump; no mutex contention in the hot path beyond the one `Mutex<State>` around `STATE`.
-
-### macOS
 
 ```
 global-hotkey crate (Carbon RegisterEventHotKey)
@@ -72,54 +56,21 @@ Summoner::summon(ident)   src/summoner.rs
         │   6. unminimize → focus → raise → activate
 ```
 
-### Windows
-
-```
-global-hotkey crate (Win32 RegisterHotKey on message pump thread)
-        │   crossbeam channel
-        ▼
-summon-hotkey-forwarder thread (src/daemon.rs spawn_hotkey_forwarder)
-        │   blocking recv() → PostMessageW(WM_SUMMON_DISPATCH, fn_ptr, ctx)
-        ▼
-msg_wnd_proc  (src/windows/dispatch.rs — Win32 HWND_MESSAGE window)
-        │   WM_SUMMON_DISPATCH → on_hotkey_press_main / on_hotkey_release_main
-        │   WM_TIMER           → on_hold_fire
-        │   WM_SUMMON_RELOAD   → on_reload_main
-        │   WM_SUMMON_STOP     → PostQuitMessage
-        ▼
-Summoner::summon(ident)   src/summoner.rs
-        │   1. find_running by exe stem (case-insensitive)
-        │   2. EnumWindows → visible, unowned, titled windows for pid
-        │   3. cycle / raise via AttachThreadInput + SetForegroundWindow
-```
-
-IPC watcher thread blocks on `WaitForMultipleObjects([reload_event, stop_event])` and posts the appropriate message to the pump window.
-
 ## Key invariants
-
-Shared:
 
 - **`Summoner::summon` is the only path that mutates cycle state.** `is_rapid` requires the *previous* press to be the same hotkey — `Ctrl+1 → Ctrl+2 → Ctrl+1` does NOT cycle windows; it returns to the last raised window.
 - **Order of operations in `summon` matters.** Minimize the previous frontmost *before* raising the target, otherwise the transition flickers.
 - **App-not-running path is fire-and-forget.** Blocking on `launch_and_wait` (up to 5s) freezes subsequent hotkey presses. The first press launches; the second press does the cycle/focus work.
-
-macOS only:
-
-- **Window identity = CGWindowID, not `AXUIElementRef`.** AX pointers are not stable across queries. `_AXUIElementGetWindow` is a private-but-stable symbol; see `src/macos/window.rs`.
+- **Window identity = CGWindowID, not `AXUIElementRef`.** AX pointers are not stable across queries. `_AXUIElementGetWindow` is a private-but-stable symbol; see `src/window.rs`.
 - **Use AX `kAXMinimizedAttribute`, not `NSRunningApplication.hide()`.** `hide()` returns NO during app activation/transition (Chrome, Edge, VSCode, Slack all rejected it in practice).
 - **Never pass `NSApplicationActivateAllWindows` to `activateWithOptions`.** It raises the app's windows on *every* display, undoing the active-display scoping `pick_window_idx` just did — a multi-monitor summon would pop the app on both screens. Default activation surfaces only main/key, which `window::focus` has already set to the picked window.
-
-Windows only:
-
-- **App identity = exe stem, not bundle ID.** Config bindings must use the lowercase exe stem, e.g. `"firefox"`. `looks_like_bundle_id()` always returns false on Windows.
-- **`SetForegroundWindow` requires foreground eligibility.** The call comes from the message-pump thread that received `WM_SUMMON_DISPATCH`, so Windows grants eligibility. `AttachThreadInput` is used as a fallback when foreground ownership differs.
 
 ## Hold-to-minimize state machine
 
 Active iff `settings.hold_threshold_ms > 0`. Press starts a timer; release before it fires → summon; timer fires first → `Summoner::minimize_on_active_display` (no focus change, no cycle-state mutation).
 
 - `State.pending_holds: HashMap<u32, u32>` maps hotkey id → the `hold_seq` of the press that opened the press→(release|timer) window. Whichever of `on_hotkey_release_main` / `on_hold_fire` runs first removes the entry; the loser no-ops.
-- **The seq tag is load-bearing, not bookkeeping.** `dispatch_after` cannot be cancelled on macOS, so press N's timer stays in flight after release. Keyed on the id alone it would consume press N+1's entry and minimize when the user meant to summon — the "have to press it twice" bug. `on_hold_fire` therefore acts only when the stored seq equals the one packed into its context. Windows derives its `SetTimer` id from the same context, so `cancel_timer` must be passed the packed value too.
+- **The seq tag is load-bearing, not bookkeeping.** `dispatch_after` cannot be cancelled on macOS, so press N's timer stays in flight after release. Keyed on the id alone it would consume press N+1's entry and minimize when the user meant to summon — the "have to press it twice" bug. `on_hold_fire` therefore acts only when the stored seq equals the one packed into its context.
 - The id and seq share one context pointer via `pack_hold_ctx` / `unpack_hold_ctx` (id in the low 32 bits), keeping the timer path allocation-free.
 - OS key-repeat: a second `Pressed` while the entry exists is ignored (no second timer scheduled).
 - On reload, `pending_holds.clear()` — hotkey ids are reassigned by `global-hotkey` at register time.
@@ -127,18 +78,11 @@ Active iff `settings.hold_threshold_ms > 0`. Press starts a timer; release befor
 
 ## Signals & control plane
 
-Both platforms use a PID file for process discovery. Signal/event delivery differs.
-
-**macOS:** `kill(pid, SIGHUP/SIGTERM)` — signals observed via libdispatch signal sources on the main queue. Don't add a thread-based signal handler; it races with main-queue handlers.
-
-**Windows:** Named Win32 events (`Local\summon-reload`, `Local\summon-stop`) — daemon creates them with `CreateEventW`; CLI opens and sets them; IPC watcher thread posts to the message pump.
+A PID file handles process discovery; `kill(pid, SIGHUP/SIGTERM)` delivers the signal. Signals are observed via libdispatch signal sources on the main queue. Don't add a thread-based signal handler; it races with main-queue handlers.
 
 ## Config
 
-| Platform | Path |
-|----------|------|
-| macOS    | `~/.config/summon/config.toml` |
-| Windows  | `%APPDATA%\summon\config.toml` |
+Config lives at `~/.config/summon/config.toml`.
 
 ```toml
 [settings]
@@ -147,13 +91,9 @@ hide_previous = false    # minimize prev app's window when switching
 hold_threshold_ms = 0    # 0 = disabled; any +ve = hold-to-minimize
 
 [bindings]
-# macOS: bundle id (preferred) or display name
+# bundle id (preferred) or display name
 "ctrl+1" = "com.mitchellh.ghostty"
 "ctrl+2" = "Google Chrome"
-
-# Windows: exe stem (case-insensitive, no .exe)
-"ctrl+1" = "firefox"
-"ctrl+2" = "Code"
 ```
 
 `HotkeySpec` normalises modifier synonyms (`opt`=`option`=`alt`, `cmd`=`command`=`meta`=`super`, `hyper`=all four) and keys (`a–z`, `0–9`, `f1–f20`, named keys). Duplicate detection happens post-normalisation, so `ctrl+1` and `control+1` collide.
@@ -170,34 +110,12 @@ hold_threshold_ms = 0    # 0 = disabled; any +ve = hold-to-minimize
 | `src/config.rs`              | TOML schema + hotkey-string parser + validation                     |
 | `src/ipc.rs`                 | PID-file based control: `running_pid`, `reload`, `stop`             |
 | `src/paths.rs`               | All platform-standard paths in one place                            |
-| `src/launchd.rs` *(macOS)*   | plist rendering, bootstrap/bootout, TCC grant polling loop          |
-| `src/macos/app.rs`           | `NSWorkspace` / `NSRunningApplication` wrappers                     |
-| `src/macos/window.rs`        | AX window enumeration, raise/focus/minimize, `_AXUIElementGetWindow` |
-| `src/macos/dispatch.rs`      | libdispatch FFI (`dispatch_async_f`, signal sources)                |
-| `src/macos/permissions.rs`   | `AXIsProcessTrustedWithOptions` wrapper                             |
-| `src/windows/app.rs`         | `EnumWindows` + `QueryFullProcessImageNameW` to find/launch apps    |
-| `src/windows/window.rs`      | `EnumWindows` window list, raise via `AttachThreadInput`            |
-| `src/windows/dispatch.rs`    | Hidden `HWND_MESSAGE` window; `PostMessageW`-based async_to_main    |
-| `src/windows/screen.rs`      | `MonitorFromPoint` / `MonitorFromRect` display tracking             |
-| `src/windows/proc.rs`        | `NtQueryInformationProcess` + `ReadProcessMemory` cmdline read      |
-| `src/windows/service.rs`     | Task Scheduler XML install/uninstall via `schtasks.exe`             |
-| `src/windows/permissions.rs` | Stub — no AX equivalent on Windows; always returns `true`          |
+| `src/launchd.rs`             | plist rendering, bootstrap/bootout, TCC grant polling loop          |
+| `src/app.rs`                 | `NSWorkspace` / `NSRunningApplication` wrappers                     |
+| `src/window.rs`              | AX window enumeration, raise/focus/minimize, `_AXUIElementGetWindow` |
+| `src/screen.rs`              | `CGDirectDisplayID` active-display / window-display tracking        |
+| `src/dispatch.rs`            | libdispatch FFI (`dispatch_async_f`, signal sources)                |
+| `src/proc.rs`                | `sysctl KERN_PROCARGS2` cmdline read                                |
+| `src/permissions.rs`         | `AXIsProcessTrustedWithOptions` wrapper                             |
 
-`src/lib.rs` re-exports everything; `src/main.rs` is one-line `cli::run`. Platform modules are `#[cfg(target_os = "...")]`-gated.
-
-## Win32 FFI gotchas
-
-- **`HWND` and `HANDLE` are `*mut c_void` in windows-sys 0.59**, not `isize`. Null checks use `.is_null()`. Store handles in statics as `usize` (cast at use) to satisfy `Send`/`Sync`.
-- **Many Win32 APIs are missing or misrouted in windows-sys 0.59 feature paths.** Declare them manually when the import fails:
-  ```rust
-  #[link(name = "kernel32")]
-  unsafe extern "system" {
-      fn OpenEventW(dw_desired_access: u32, b_inherit_handle: i32, lp_name: *const u16) -> *mut std::ffi::c_void;
-  }
-  ```
-  Affected functions: `CreateEventW`, `OpenEventW`, `SetEvent`, `WaitForMultipleObjects`, `QueryFullProcessImageNameW`, `AttachThreadInput`.
-- **`INFINITE` and `WAIT_OBJECT_0`** may not resolve from `Win32::Foundation`. Use literals `0xFFFF_FFFFu32` and `0u32`.
-- **`STILL_ACTIVE`** is `259u32` — declare as a constant.
-- **`DPI_AWARENESS_CONTEXT`** is `*mut c_void`. Pass `(-4isize) as *mut c_void` for `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`.
-- **Rust 2024 requires explicit `unsafe {}` inside `unsafe fn`** for calls to unsafe functions. Wrap them to silence the lint.
-- **`GlobalHotKeyManager` (Windows) does not implement `Send`** — add `unsafe impl Send for State {}` on the Windows `State` struct. It is only mutated on the message-pump thread.
+`src/lib.rs` re-exports everything; `src/main.rs` is one-line `cli::run`. The crate is macOS-only — a `compile_error!` in `src/lib.rs` guards any other target, and there are no `#[cfg(target_os = ...)]` gates left.

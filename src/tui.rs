@@ -282,13 +282,7 @@ fn handle_browse_apps(app: &mut App, key: KeyCode) -> Result<bool> {
         KeyCode::Enter => assign_selected_app(app),
         // Cancel: go back to bindings pane (remove placeholder if new-binding flow).
         KeyCode::Tab | KeyCode::Esc => cancel_app_selection(app),
-        KeyCode::Char('r') => {
-            app.running_apps = list_platform_apps();
-            app.search_buf.clear();
-            app.search_active = false;
-            reset_app_selection(app);
-            app.status = Some(format!("Refreshed — {} apps", app.running_apps.len()));
-        }
+        KeyCode::Char('r') => apply_refresh(app, list_platform_apps()),
         KeyCode::Char('q') => {
             save_config(app)?;
             return Ok(true);
@@ -689,19 +683,18 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
 
 // ── Platform app listing ───────────────────────────────────────────────────────
 
-#[cfg(target_os = "macos")]
 fn list_platform_apps() -> Vec<(String, String)> {
-    crate::macos::app::list_running_apps()
+    crate::app::list_running_apps()
 }
 
-#[cfg(target_os = "windows")]
-fn list_platform_apps() -> Vec<(String, String)> {
-    crate::windows::app::list_running_apps()
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn list_platform_apps() -> Vec<(String, String)> {
-    Vec::new()
+/// Replace the app list and reset the surrounding browse state. Split out from
+/// the `r` key handler so it is testable without enumerating real running apps.
+fn apply_refresh(app: &mut App, apps: Vec<(String, String)>) {
+    app.running_apps = apps;
+    app.search_buf.clear();
+    app.search_active = false;
+    reset_app_selection(app);
+    app.status = Some(format!("Refreshed — {} apps", app.running_apps.len()));
 }
 
 #[cfg(test)]
@@ -1201,17 +1194,17 @@ mod tests {
         assert_eq!(app.binding_state.selected(), None);
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
-    fn refresh_reloads_platform_app_list_and_clears_search() {
+    fn refresh_replaces_app_list_and_clears_search() {
         let mut app = sample_app();
         app.pane = Pane::Apps;
         app.search_buf = "saf".into();
-        app.search_active = false;
-        handle_browse(&mut app, KeyCode::Char('r')).unwrap();
-        assert!(app.running_apps.is_empty(), "stub platform lists no apps");
+        app.search_active = true;
+        apply_refresh(&mut app, pairs(&[("com.apple.Safari", "Safari")]));
+        assert_eq!(app.running_apps, pairs(&[("com.apple.Safari", "Safari")]));
         assert_eq!(app.search_buf, "");
-        assert!(app.status.as_deref().unwrap().contains("Refreshed"));
+        assert!(!app.search_active);
+        assert!(app.status.as_deref().unwrap().contains("Refreshed — 1 apps"));
     }
 
     // --- rendering (in-memory TestBackend, no terminal) ---

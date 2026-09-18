@@ -7,8 +7,8 @@ set -euo pipefail
 #   1. The default report — coverage of everything that compiles on the host.
 #   2. The "testable surface" report — excludes only the modules that are
 #      pure OS entry points (see .claude/skills/rust-tests): daemon.rs
-#      (message pump / signal handlers), main.rs, launchd.rs, and the
-#      macos/ and windows/ platform modules.
+#      (run loop / signal handlers), main.rs, launchd.rs, and the Cocoa/AX
+#      wrappers (app, window, screen, dispatch, proc, permissions).
 #
 # Principle: test our code's outcomes; never test OS methods, never mock
 # them. Known OS-bound remainders inside the included files (kept visible
@@ -28,9 +28,15 @@ set -euo pipefail
 #   ./scripts/coverage.sh --html    # also write HTML to target/llvm-cov/html
 
 cd "$(dirname "$0")/.."
-source "$HOME/.cargo/env" 2>/dev/null || true
 
-UNTESTABLE='(daemon|main|launchd)\.rs$|src/(macos|windows)/'
+if ! cargo llvm-cov --version >/dev/null 2>&1; then
+    echo "cargo-llvm-cov not installed. One-time setup:" >&2
+    echo "  rustup component add llvm-tools-preview" >&2
+    echo "  cargo install cargo-llvm-cov --locked" >&2
+    exit 1
+fi
+
+UNTESTABLE='src/(daemon|main|launchd|app|window|screen|dispatch|proc|permissions)\.rs$'
 
 echo "=== Full report (everything compiled on host) ==="
 cargo llvm-cov --summary-only
